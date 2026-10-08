@@ -15,6 +15,8 @@ import android.graphics.Typeface
 import android.media.AudioAttributes
 import android.net.Uri
 import android.os.Build
+import android.os.PowerManager
+import android.provider.Settings
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.NotificationCompat
 import androidx.core.app.Person
@@ -226,6 +228,7 @@ open class NativePushReceiver : FlutterFirebaseMessagingReceiver() {
             preferences.edit().putLong("ringing_$callId", postedAt + remaining.coerceAtMost(45000)).apply()
             manager.notify(id, notification)
             recordResult(context, "posted_call")
+            showCallOverOtherApps(context, data)
             val avatar = data["caller_avatar"].orEmpty()
             if (avatar.startsWith("https://")) images.execute {
                 val bitmap = fetchAvatar(avatar) ?: return@execute
@@ -237,6 +240,27 @@ open class NativePushReceiver : FlutterFirebaseMessagingReceiver() {
                 manager.notify(id, builder.build().apply { flags = flags or android.app.Notification.FLAG_INSISTENT })
             }
             return true
+        }
+
+        /** Full-screen notification intents normally become banners on an unlocked phone.
+         * Android permits an Activity launch from the background with the user's
+         * Display over other apps grant. Keep the notification if an OEM blocks it.
+         * Locked/sleeping phones remain on the system full-screen-intent path.
+         */
+        private fun showCallOverOtherApps(context: Context, data: Map<String, String>) {
+            try {
+                if (MainActivity.isResumed || !Settings.canDrawOverlays(context)) return
+                if (context.getSystemService(KeyguardManager::class.java).isKeyguardLocked ||
+                    !context.getSystemService(PowerManager::class.java).isInteractive) return
+                val manager = context.getSystemService(NotificationManager::class.java)
+                // Do not use the overlay grant to bypass DND or a silenced channel.
+                if (manager.currentInterruptionFilter != NotificationManager.INTERRUPTION_FILTER_ALL) return
+                if (Build.VERSION.SDK_INT >= 26 &&
+                    (manager.getNotificationChannel(CALL_CHANNEL)?.importance ?: 0) < NotificationManager.IMPORTANCE_HIGH) return
+                context.startActivity(callScreenIntent(context, data))
+            } catch (error: Exception) {
+                android.util.Log.w("DahimailPush", "Incoming screen launch failed: ${error.javaClass.simpleName}")
+            }
         }
 
         internal fun showAlert(context: Context, data: Map<String, String>): Boolean {

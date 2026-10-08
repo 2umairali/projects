@@ -3,7 +3,11 @@ package com.dahify.dahimail
 import android.app.Application
 import android.app.KeyguardManager
 import android.app.NotificationManager
+import android.app.NotificationChannel
+import android.os.PowerManager
+import org.robolectric.shadows.ShadowSettings
 import android.content.Context
+import android.content.ContextWrapper
 import android.content.Intent
 import android.os.Bundle
 import com.google.firebase.messaging.RemoteMessage
@@ -54,6 +58,105 @@ class NativeMessagingServiceTest {
         manager.cancelAll()
         context.getSharedPreferences("native_push", Context.MODE_PRIVATE).edit().clear().commit()
         MainActivity.isResumed = false
+        ShadowSettings.setCanDrawOverlays(false)
+        shadowOf(context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(false)
+        shadowOf(context.getSystemService(PowerManager::class.java)).setIsInteractive(true)
+        manager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+    }
+
+    @Test @Config(sdk = [28, 33, 35]) fun coldCallOpensOverAnotherAppOnlyWithOverlayPermission() {
+        ShadowSettings.setCanDrawOverlays(true)
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming())
+        val launch = shadowOf(context as Application).nextStartedActivity
+        assertEquals(IncomingCallActivity::class.java.name, launch?.component?.className)
+        assertTrue(launch!!.getStringExtra("call_data")!!.contains("Alice Example"))
+        assertEquals(1, manager.activeNotifications.size)
+        // Neither FCM redelivery nor Flutter's fallback may open a second screen.
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        service.destroy()
+    }
+
+    @Test fun deniedActivityLaunchKeepsNativeNotificationAvailable() {
+        ShadowSettings.setCanDrawOverlays(true)
+        var attempted = false
+        val restricted = object : ContextWrapper(context) {
+            override fun startActivity(intent: Intent) {
+                attempted = true
+                throw SecurityException("Synthetic OEM background launch restriction")
+            }
+        }
+        assertTrue(NativePushReceiver.showCall(restricted, incoming().data))
+        assertTrue(attempted)
+        assertEquals(1, manager.activeNotifications.size)
+        assertNotNull(manager.activeNotifications.single().notification.fullScreenIntent)
+    }
+
+    @Test fun overlayGrantCannotBypassDisabledNotifications() {
+        ShadowSettings.setCanDrawOverlays(true)
+        shadowOf(manager).setNotificationsEnabled(false)
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        assertEquals(0, manager.activeNotifications.size)
+        service.destroy()
+    }
+
+    @Test fun withoutOverlayPermissionCallKeepsActionableNotification() {
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        val notification = manager.activeNotifications.single().notification
+        assertNotNull(notification.fullScreenIntent)
+        assertEquals(2, notification.actions.size)
+        service.destroy()
+    }
+
+    @Test fun overlayPermissionDoesNotBypassLockScreenOrSleepingPhone() {
+        ShadowSettings.setCanDrawOverlays(true)
+        shadowOf(context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(true)
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        assertNotNull(manager.activeNotifications.single().notification.fullScreenIntent)
+        manager.cancelAll()
+        shadowOf(context.getSystemService(KeyguardManager::class.java)).setKeyguardLocked(false)
+        shadowOf(context.getSystemService(PowerManager::class.java)).setIsInteractive(false)
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        assertNotNull(manager.activeNotifications.single().notification.fullScreenIntent)
+        service.destroy()
+    }
+
+    @Test fun overlayPermissionDoesNotBypassDndOrSilentCallChannel() {
+        ShadowSettings.setCanDrawOverlays(true)
+        manager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_NONE)
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        manager.cancelAll()
+        manager.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+        manager.createNotificationChannel(NotificationChannel("dm_calls_v3", "Calls", NotificationManager.IMPORTANCE_LOW))
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        assertEquals(1, manager.activeNotifications.size)
+        service.destroy()
+    }
+
+    @Test fun overlayPermissionCannotLaunchExpiredCancelledOrForegroundCalls() {
+        ShadowSettings.setCanDrawOverlays(true)
+        val service = Robolectric.buildService(RecordingMessagingService::class.java).create()
+        service.get().onMessageReceived(incoming(System.currentTimeMillis() / 1000 - 60))
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        NativePushReceiver.dismissCall(context, 42)
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        MainActivity.isResumed = true
+        service.get().onMessageReceived(incoming())
+        assertNull(shadowOf(context as Application).nextStartedActivity)
+        assertEquals(0, manager.activeNotifications.size)
+        service.destroy()
     }
 
     @Test fun firebaseResolvesTheNativeServiceInsteadOfTheNoOpFlutterService() {
