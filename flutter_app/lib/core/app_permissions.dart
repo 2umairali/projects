@@ -13,7 +13,7 @@ import 'theme.dart';
 ///  • notifications (+ calls on the lock screen) : once, right after the first sign-in, with a plain explanation;
 ///  • microphone / camera                       : the first time a call, voice message or photo needs them;
 ///  • contacts                                  : when the person taps "Find friends from my contacts";
-///  • floating call window (over other apps)    : the first time a call is minimised;
+///  • calls over other apps                    : after sign-in; also used by the floating call window;
 ///  • battery "keep running" page               : offered once, after the first call, on phones that stop background apps.
 /// Every explanation is shown ONCE per permission; afterwards only the phone's own dialog (or the Settings shortcut) appears.
 class AppPermissions {
@@ -75,12 +75,12 @@ class AppPermissions {
     final p = await SharedPreferences.getInstance();
     if (p.getBool('perm_setup_v3') == true) {
       // Existing installs may predate the Android 14 full-screen permission request.
-      if (await NotifyService.I.allowed() && context.mounted) await _lockScreenCalls(context);
+      if (await NotifyService.I.allowed() && context.mounted) await _incomingCallPermissions(context);
       return;
     }
     if (await NotifyService.I.allowed()) {
       await p.setBool('perm_setup_v3', true);
-      await _lockScreenCalls(context);
+      await _incomingCallPermissions(context);
       return;
     }
     if (!context.mounted) return;
@@ -94,8 +94,24 @@ class AppPermissions {
     await p.setBool('perm_setup_v3', true);
     if (yes) {
       await NotifyService.I.requestPermission();
-      if (context.mounted) await _lockScreenCalls(context);
+      if (context.mounted) await _incomingCallPermissions(context);
     }
+  }
+
+  static Future<void> _incomingCallPermissions(BuildContext context) async {
+    await _lockScreenCalls(context);
+    if (!Platform.isAndroid || !context.mounted ||
+        WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      return;
+    }
+    if (await NativeCalls.canDraw() || await _seen('incoming_over_apps')) return;
+    if (!context.mounted) return;
+    await _mark('incoming_over_apps');
+    final yes = await explain(context, icon: Icons.phone_in_talk_rounded,
+      title: 'Show incoming calls over other apps',
+      why: 'Allow Display over other apps so the incoming call screen can open while you use another app. Without it, Android normally shows a call notification. You can change this later in Device notifications.',
+      yes: 'Open setting');
+    if (yes) await NativeCalls.requestDraw();
   }
 
   /// Android 14+: calls can only fill the lock screen when the person allows "full-screen notifications".

@@ -94,7 +94,7 @@ class DeviceNotificationsPage extends StatefulWidget {
 
 class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with WidgetsBindingObserver {
   bool? _allowed;
-  bool? _fullScreen;
+  bool? _fullScreen, _overOtherApps;
   String? _lastPush, _deliveryDetails;
 
   @override
@@ -118,9 +118,10 @@ class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with 
   Future<void> _check() async {
     final a = await NotifyService.I.allowed();
     final fullScreen = await DeviceEnv.canFullScreenIntent();
+    final overOtherApps = await NativeCalls.canDraw();
     final lastPush = await PushReceipt.lastReceived();
     final details = await DeviceEnv.notificationDiagnostics();
-    if (mounted) setState(() { _allowed = a; _fullScreen = fullScreen; _lastPush = lastPush; _deliveryDetails = details; });
+    if (mounted) setState(() { _allowed = a; _fullScreen = fullScreen; _overOtherApps = overOtherApps; _lastPush = lastPush; _deliveryDetails = details; });
   }
 
   Future<void> _batterySettings(BuildContext context) async {
@@ -218,10 +219,14 @@ class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with 
           }, icon: const Icon(Icons.sync_rounded), label: Text(status.busy ? 'Checking…' : 'Check connection')),
           if (_deliveryDetails != null) Padding(padding: const EdgeInsets.only(top: 12), child: SelectableText(_deliveryDetails!, style: Theme.of(context).textTheme.bodySmall)),
           if (Platform.isAndroid) ...[
+            ListTile(contentPadding: EdgeInsets.zero, title: const Text('Incoming calls over other apps'),
+              subtitle: Text(_overOtherApps == true ? 'Allowed' : 'Allow Display over other apps to open the incoming call screen'),
+              trailing: const Icon(Icons.open_in_new), onTap: () async { await NativeCalls.requestDraw(); }),
             ListTile(contentPadding: EdgeInsets.zero, title: const Text('Incoming calls on lock screen'),
               subtitle: Text(_fullScreen == true ? 'Allowed' : 'Permission needed for full-screen calls'),
               trailing: const Icon(Icons.open_in_new), onTap: DeviceEnv.openFullScreenIntentSettings),
           ],
+          if (Platform.isAndroid) const Padding(padding: EdgeInsets.only(top: 8), child: Text('After Force stop in Android settings, open Dahimail again to receive calls. Some phones also require Autostart and unrestricted background battery use.')),
           TextButton.icon(onPressed: () => _batterySettings(context), icon: const Icon(Icons.battery_charging_full_rounded), label: const Text('Background battery settings')),
         ])),
       ),
@@ -501,8 +506,8 @@ class _PermissionsPageState extends State<PermissionsPage> with WidgetsBindingOb
       if (Platform.isAndroid) ...[
         row(Icons.phone_in_talk_rounded, 'Calls on the lock screen', 'Lets an incoming call fill the screen like a normal phone call, also when the phone is locked.',
             status: _lockCalls ? 'Allowed' : 'Off – calls show only as a small banner', ok: _lockCalls, actionLabel: _lockCalls ? null : 'Allow', action: _lockCalls ? null : () async { await DeviceEnv.openFullScreenIntentSettings(); }),
-        row(Icons.picture_in_picture_alt_rounded, 'Floating call window', 'A small window with Mute and End over other apps while a call runs.',
-            status: _overlay ? 'Allowed' : 'Off – asked when you minimise a call', ok: _overlay, actionLabel: _overlay ? null : 'Allow', action: _overlay ? null : () async { await NativeCalls.requestDraw(); }),
+        row(Icons.picture_in_picture_alt_rounded, 'Calls over other apps', 'Opens the incoming call screen over another app and allows a small window with Mute and End during a call.',
+            status: _overlay ? 'Allowed' : 'Off – incoming calls use a notification', ok: _overlay, actionLabel: _overlay ? null : 'Allow', action: _overlay ? null : () async { await NativeCalls.requestDraw(); }),
         row(Icons.battery_charging_full_rounded, 'Run in the background', 'Some phones stop apps to save battery, so calls arrive late. Set this app to "Unrestricted".',
             status: 'Check on this phone', ok: true, actionLabel: 'Open', action: () => NativeCalls.openBatterySettings()),
       ],
