@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../core/api.dart';
 import '../core/notification_presentation.dart';
 import '../core/calls.dart';
+import '../core/conversation_visibility.dart';
 import '../core/forms.dart';
 import '../core/paged.dart';
 import '../core/session.dart';
@@ -89,7 +90,7 @@ class _ConversationsPageState extends State<ConversationsPage> {
       color: unread > 0 ? Color.alphaBlend(AppColors.primary.withValues(alpha: 0.05), surface) : surface,
       child: InkWell(
         onTap: () async {
-          await pushPage(c, FriendChatPage(friend: {'id': f['id'], 'name': f['name'], 'avatar_url': f['avatar_url']}, features: _friendFeatures));
+          await pushPage(c, FriendChatPage(friend: {'id': f['id'], 'name': f['name'], 'avatar_url': f['avatar_url'], 'former': f['former']}, features: _friendFeatures));
           _loadFriends();
         },
         child: Container(
@@ -404,7 +405,7 @@ class ConversationDetailPage extends StatefulWidget {
   State<ConversationDetailPage> createState() => _ConversationDetailPageState();
 }
 
-class _ConversationDetailPageState extends State<ConversationDetailPage> {
+class _ConversationDetailPageState extends State<ConversationDetailPage> with ConversationVisibility<ConversationDetailPage> {
   Item _conv = {};
   List<Item> _msgs = [];
   final _full = <int, String>{};
@@ -417,11 +418,13 @@ class _ConversationDetailPageState extends State<ConversationDetailPage> {
   final _reply = TextEditingController();
   final _scroll = ScrollController();
   Timer? _live;
-  bool _ticking = false;
+  bool _ticking = false, _acknowledging = false;
+  int _readThrough = 0;
 
   @override
   void initState() {
     super.initState();
+    _scroll.addListener(_acknowledgeVisible);
     WidgetsBinding.instance.addPostFrameCallback((_) => _load());
     _live = Timer.periodic(const Duration(seconds: 4), (_) => _liveTick());
   }
@@ -437,21 +440,23 @@ class _ConversationDetailPageState extends State<ConversationDetailPage> {
   /// Live chat: quietly re-reads the open conversation and appends new messages the moment they arrive
   /// (keeps your scroll position unless you are already at the bottom).
   Future<void> _liveTick() async {
-    if (_ticking || _loading || _sending || !mounted || !TickerMode.valuesOf(context).enabled) return;
+    if (_ticking || _loading || _sending || !conversationVisible) return;
+    final epoch = visibilityEpoch;
+    afterVisibleFrame(_acknowledgeVisible);
     _ticking = true;
     try {
-      final j = await Api.of(context).get('inbox/conversations/${widget.id}/messages');
+      final j = await Api.of(context).getNoCache('inbox/conversations/${widget.id}/messages', query: {'mark_read': '0'});
       final m = j is Map ? j : {};
       final fresh = Api.list(m['messages']);
       final oldLast = _msgs.isEmpty ? 0 : (_msgs.last['id'] as num?)?.toInt() ?? 0;
       final newLast = fresh.isEmpty ? 0 : (fresh.last['id'] as num?)?.toInt() ?? 0;
-      if (!mounted || (fresh.length == _msgs.length && newLast == oldLast)) return;
+      if (!conversationVisible || epoch != visibilityEpoch || (fresh.length == _msgs.length && newLast == oldLast)) return;
       final atBottom = !_scroll.hasClients || _scroll.position.maxScrollExtent - _scroll.offset < 140;
       setState(() {
         _conv = m['conversation'] is Map ? Map<String, dynamic>.from(m['conversation']) : _conv;
         _msgs = fresh;
       });
-      if (!widget.trashed) Api.of(context).post('inbox/conversations/${widget.id}/action', {'action': 'mark_read'}).catchError((_) {});
+      afterVisibleFrame(_acknowledgeVisible);
       _prefetchBodies();
       if (atBottom) {
         WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -465,17 +470,19 @@ class _ConversationDetailPageState extends State<ConversationDetailPage> {
   }
 
   Future<void> _load() async {
+    if (!conversationVisible) return;
+    final epoch = visibilityEpoch;
     try {
       final api = Api.of(context);
-      final j = await api.get('inbox/conversations/${widget.id}/messages');
+      final j = await api.getNoCache('inbox/conversations/${widget.id}/messages', query: {'mark_read': '0'});
       final m = j is Map ? j : {};
-      if (!mounted) return;
+      if (!conversationVisible || epoch != visibilityEpoch) return;
       setState(() {
         _conv = m['conversation'] is Map ? Map<String, dynamic>.from(m['conversation']) : {};
         _msgs = Api.list(m['messages']);
         _loading = false;
       });
-      if (!widget.trashed) api.post('inbox/conversations/${widget.id}/action', {'action': 'mark_read'}).catchError((_) {});
+      afterVisibleFrame(_acknowledgeVisible);
       _prefetchBodies();
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (_scroll.hasClients) _scroll.jumpTo(_scroll.position.maxScrollExtent);
@@ -483,6 +490,24 @@ class _ConversationDetailPageState extends State<ConversationDetailPage> {
     } on ApiException catch (e) {
       if (mounted) setState(() { _err = e.message; _loading = false; });
     }
+  }
+
+  @override
+  void onConversationVisibilityChanged(bool visible) {
+    if (visible) afterVisibleFrame(() { if (_loading) { _load(); } else { _liveTick(); } });
+  }
+
+  Future<void> _acknowledgeVisible() async {
+    if (!conversationVisible || widget.trashed || _msgs.isEmpty || _acknowledging) return;
+    if (_scroll.hasClients && _scroll.position.maxScrollExtent - _scroll.offset >= 140) return;
+    final through = _msgs.map((m) => (m['id'] as num?)?.toInt() ?? 0).reduce((a, b) => a > b ? a : b);
+    if (through <= _readThrough) return;
+    _acknowledging = true;
+    try {
+      await Api.of(context).post('inbox/conversations/${widget.id}/action', {'action': 'mark_read', 'through_message_id': through});
+      _readThrough = through;
+    } catch (_) { /* Retry only while this conversation is visible. */ }
+    finally { _acknowledging = false; }
   }
 
   /// Loads the formatted (HTML) body and attachment list of the latest email messages.

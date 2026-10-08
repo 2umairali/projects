@@ -162,6 +162,7 @@ Route::prefix('v1')->middleware(['auth:sanctum', 'throttle:api'])->group(functio
     Route::put('me/phone/discoverable',                 [Mobile\FriendsController::class, 'discoverable']);
     Route::post('friends/sync-contacts', [\App\Http\Controllers\Api\Mobile\FriendsController::class, 'syncContacts'])->middleware('throttle:sensitive');
     Route::get('friends/{userId}/messages', [\App\Http\Controllers\Friends\FriendChatController::class, 'messages'])->whereNumber('userId');
+    Route::post('friends/{userId}/read', [\App\Http\Controllers\Friends\FriendChatController::class, 'read'])->whereNumber('userId');
     Route::post('friends/{userId}/messages', [\App\Http\Controllers\Friends\FriendChatController::class, 'send'])->whereNumber('userId');
     Route::get('friends/messages/{messageId}/file', [\App\Http\Controllers\Friends\FriendChatController::class, 'file'])->whereNumber('messageId');
     Route::post('friends/{userId}/call', [\App\Http\Controllers\Friends\FriendCallController::class, 'start'])->whereNumber('userId');

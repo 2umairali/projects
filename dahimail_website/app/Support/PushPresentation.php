@@ -4,6 +4,33 @@ namespace App\Support;
 
 final class PushPresentation
 {
+    /** Only actual incoming messages expose Reply; event notifications expose View. */
+    public static function replyTarget(array $data): array
+    {
+        $type = $data['type'] ?? '';
+        if ($type === 'chat' && (int) ($data['from_id'] ?? 0) > 0) {
+            return ['reply_kind' => 'friend', 'reply_id' => (string) $data['from_id']];
+        }
+        if (in_array($type, ['email_received', 'new_email', 'contact_reply', 'message', 'new_conversation'], true)) {
+            $url = parse_url((string) ($data['action_url'] ?? ''));
+            if (($url['path'] ?? '') === '/inbox') {
+                parse_str($url['query'] ?? '', $query);
+                $id = filter_var($query['cid'] ?? $query['conversation'] ?? null, FILTER_VALIDATE_INT);
+                if ($id > 0) return ['reply_kind' => 'conversation', 'reply_id' => (string) $id];
+            }
+        }
+        return [];
+    }
+
+    public static function body(array $data, string $fallback): string
+    {
+        return match ($data['type'] ?? '') {
+            'friend_request' => 'Sent you a friend request',
+            'friend_accepted' => 'Accepted your friend request',
+            default => $fallback,
+        };
+    }
+
     public static function action(array $data): string
     {
         return match ($data['type'] ?? '') {
@@ -24,6 +51,10 @@ final class PushPresentation
     public static function for(array $data): array
     {
         $type = (string) ($data['type'] ?? '');
+        if (in_array($type, ['email_received', 'new_email'], true)) return ['New email', 'email'];
+        if ($type === 'friend_request') return ['Friend request', 'notify'];
+        if ($type === 'friend_accepted') return ['Friend request accepted', 'notify'];
+        if ($type === 'friend_suggestion') return ['Friend suggestion', 'notify'];
         if (str_contains($type, 'meeting')) return ['Meeting', 'meeting'];
         if (str_contains($type, 'call')) {
             $video = in_array($data['video'] ?? false, [true, 1, '1', 'true'], true) && !in_array($data['audio_only'] ?? false, [true, 1, '1', 'true'], true);

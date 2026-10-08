@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:io' show Platform;
 import 'dart:convert';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -334,6 +335,21 @@ class CallManager with WidgetsBindingObserver {
   void didChangeAppLifecycleState(AppLifecycleState s) {
     _foreground = s == AppLifecycleState.resumed;
     if (_foreground) { _tick(); AppRefresh.bump(); }
+    if (s == AppLifecycleState.paused && Platform.isAndroid && !inRoom) {
+      final call = incomingVideo;
+      if (call != null && call['sent_at'] != null) {
+        final peer = call['peer'] is Map ? call['peer'] as Map : const {};
+        _ringing = false;
+        _ring?.cancel();
+        _ring = null;
+        _ringer.stop();
+        NotifyService.showIncomingCall({
+          'call_id': call['id'], 'sent_at': call['sent_at'], 'ttl': call['ttl'] ?? 45,
+          'caller_name': peer['name'], 'caller_avatar': peer['avatar_url'], 'video': call['video'], 'audio_only': call['audio_only'],
+          'recipient_user_id': _session?.userId,
+        }).catchError((_) {});
+      }
+    }
   }
 
   /// A push arrived while the app is open: look at the server right now instead of waiting for the timer.
@@ -350,7 +366,7 @@ class CallManager with WidgetsBindingObserver {
     final expired = sent != null && DateTime.now().millisecondsSinceEpoch ~/ 1000 >= sent + ttl;
     if (_foreground && _session?.isLoggedIn == true && !expired && id != null && !CallKitBridge.ringing.contains(id) && room.isNotEmpty && !inRoom && active == null) {
       _showVideo({
-        'id': id, 'video': true, 'meeting': room, 'status': 'ringing',
+        'id': id, 'video': true, 'meeting': room, 'status': 'ringing', 'sent_at': sent, 'ttl': ttl,
         'audio_only': NotificationPresentation.flag(data['audio_only']), 'group': NotificationPresentation.flag(data['group']),
         'peer': {'id': int.tryParse('${data['caller_id']}'), 'name': '${data['caller_name'] ?? 'Dahimail'}', 'avatar_url': data['caller_avatar']},
       });

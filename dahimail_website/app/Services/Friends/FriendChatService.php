@@ -62,6 +62,7 @@ class FriendChatService
     /** Who may chat and call: accepted friends, and members of the same workspace (no friend request needed between teammates). */
     public function areFriends(int $a, int $b): bool
     {
+        if ($this->wasFriends($a, $b)) return false;
         return DB::table('friend_requests')->where('status', 'accepted')->where(fn ($q) => $q
             ->where(fn ($w) => $w->where('requester_id', $a)->where('addressee_id', $b))
             ->orWhere(fn ($w) => $w->where('requester_id', $b)->where('addressee_id', $a)))->exists()
@@ -82,7 +83,7 @@ class FriendChatService
     /** the friendship row of two people, whatever its state (accepted / unfriended / …) */
     public function pairRow(int $a, int $b): ?object
     {
-        return DB::table('friend_requests')->whereIn('status', ['accepted', 'unfriended'])->where(fn ($q) => $q
+        return DB::table('friend_requests')->where(fn ($q) => $q->whereIn('status', ['accepted', 'unfriended'])->orWhereNotNull('unfriended_at'))->where(fn ($q) => $q
             ->where(fn ($w) => $w->where('requester_id', $a)->where('addressee_id', $b))
             ->orWhere(fn ($w) => $w->where('requester_id', $b)->where('addressee_id', $a)))->first();
     }
@@ -91,7 +92,7 @@ class FriendChatService
     public function wasFriends(int $a, int $b): bool
     {
         $r = $this->pairRow($a, $b);
-        return $r && $r->status === 'unfriended';
+        return $r && $r->status !== 'accepted' && ($r->status === 'unfriended' || $r->unfriended_at !== null);
     }
 
     /** may $me OPEN this chat? current friends, teammates and FORMER friends (read-only) */
@@ -111,8 +112,8 @@ class FriendChatService
             'state' => $current ? ($r && $r->status === 'accepted' ? 'friends' : 'team') : ($r ? 'former' : 'none'),
             'read_only' => !$current,
             'since' => $r ? $fmt($r->responded_at) : null,
-            'ended_at' => ($r && $r->status === 'unfriended') ? $fmt($r->unfriended_at) : null,
-            'ended_by_me' => ($r && $r->status === 'unfriended') ? (int) $r->unfriended_by === $meId : null,
+            'ended_at' => ($r && $this->wasFriends($meId, $otherId)) ? $fmt($r->unfriended_at) : null,
+            'ended_by_me' => ($r && $this->wasFriends($meId, $otherId)) ? (int) $r->unfriended_by === $meId : null,
         ];
     }
 
@@ -188,7 +189,7 @@ class FriendChatService
             'date' => $t->format('M j'),
             'at' => $t->toIso8601String(),
             'read' => $this->tickState($m, $meId) === 'read',
-            'status' => (int) $m->sender_id === $meId ? $this->tickState($m, $meId) : null, // sent | delivered | read (mine only)
+            'status' => (int) $m->sender_id === $meId && !in_array($m->kind, ['call', 'system'], true) ? $this->tickState($m, $meId) : null, // sent | delivered | read (mine only)
             'delivered_at' => ((int) $m->sender_id === $meId && ($m->delivered_at ?? $m->read_at)) ? Carbon::parse($m->delivered_at ?? $m->read_at)->format('M j, H:i') : null,
             'read_at' => ((int) $m->sender_id === $meId && $m->read_at && $this->tickState($m, $meId) === 'read') ? Carbon::parse($m->read_at)->format('M j, H:i') : null,
             'forwarded' => !$gone && (bool) ($m->forwarded ?? 0),
@@ -241,7 +242,7 @@ class FriendChatService
      * deleted since $since (a server time returned by the previous call), and "now" (the time to send back next time).
      * @return array{data:array,changes:array,now:string}
      */
-    public function messages(User $me, int $otherId, ?int $after, ?string $since = null): array
+    public function messages(User $me, int $otherId, ?int $after, ?string $since = null, bool $markRead = true): array
     {
         $other = $this->viewableOrFail($me, $otherId);
         $cut = $this->cutoff($me->id, $otherId);
@@ -257,9 +258,22 @@ class FriendChatService
                 })->orderBy('id')->limit(100)->get();
             } catch (\Throwable $e) {}
         }
-        $read = DB::table('friend_messages')->where('sender_id', $otherId)->where('recipient_id', $me->id)->whereNull('read_at')->update(['read_at' => now(), 'delivered_at' => now()]);
-        if ($read) \App\Services\RealtimeUpdates::users([$me->id, $otherId], ['type' => 'chat_read']);
+        if ($markRead && $rows->isNotEmpty()) $this->markRead($me, $otherId, (int) $rows->max('id'));
         return ['data' => $this->shapeMany($rows, $me->id, $other->name), 'changes' => $this->shapeMany($changes, $me->id, $other->name), 'now' => $now->toIso8601String(), 'relation' => $this->relation($me->id, $otherId)];
+    }
+
+    /** Acknowledge only messages the client has rendered; never later arrivals. */
+    public function markRead(User $me, int $otherId, int $through): int
+    {
+        $this->viewableOrFail($me, $otherId);
+        $cut = $this->cutoff($me->id, $otherId);
+        $visible = DB::table('friend_messages')->where(fn ($q) => $this->pair($q, $me->id, $otherId))->where('id', '>', $cut);
+        abort_unless((clone $visible)->where('id', $through)->exists(), 422, 'Message is not in this conversation.');
+        $read = (clone $visible)->where('sender_id', $otherId)->where('recipient_id', $me->id)
+            ->where('id', '<=', $through)->whereNull('read_at')->whereNull('deleted_at')
+            ->update(['read_at' => now(), 'delivered_at' => now()]);
+        if ($read) \App\Services\RealtimeUpdates::users([$me->id, $otherId], ['type' => 'chat_read']);
+        return $read;
     }
 
     /** @return array{0:bool,1:string,2:?array} */
@@ -366,16 +380,16 @@ class FriendChatService
     private function allowedIds(User $me): array
     {
         $f = DB::table('friend_requests')->where('status', 'accepted')->where(fn ($q) => $q->where('requester_id', $me->id)->orWhere('addressee_id', $me->id))
-            ->get(['requester_id', 'addressee_id'])->map(fn ($r) => (int) ($r->requester_id === $me->id ? $r->addressee_id : $r->requester_id))->all();
+            ->get(['requester_id', 'addressee_id'])->map(fn ($r) => (int) ((int) $r->requester_id === (int) $me->id ? $r->addressee_id : $r->requester_id))->all();
         $t = DB::table('workspace_members as x')->join('workspace_members as y', 'x.workspace_id', '=', 'y.workspace_id')->where('x.user_id', $me->id)->pluck('y.user_id')->map(fn ($i) => (int) $i)->all();
-        return array_flip(array_merge($f, $t));
+        return array_diff_key(array_flip(array_merge($f, $t)), $this->formerIds($me));
     }
 
     /** ids of people you were friends with and are not any more (id => true) */
     private function formerIds(User $me): array
     {
-        return DB::table('friend_requests')->where('status', 'unfriended')->where(fn ($q) => $q->where('requester_id', $me->id)->orWhere('addressee_id', $me->id))
-            ->get(['requester_id', 'addressee_id'])->mapWithKeys(fn ($r) => [(int) ($r->requester_id === $me->id ? $r->addressee_id : $r->requester_id) => true])->all();
+        return DB::table('friend_requests')->where('status', '!=', 'accepted')->where(fn ($q) => $q->where('status', 'unfriended')->orWhereNotNull('unfriended_at'))->where(fn ($q) => $q->where('requester_id', $me->id)->orWhere('addressee_id', $me->id))
+            ->get(['requester_id', 'addressee_id'])->mapWithKeys(fn ($r) => [(int) ((int) $r->requester_id === (int) $me->id ? $r->addressee_id : $r->requester_id) => true])->all();
     }
 
     /**

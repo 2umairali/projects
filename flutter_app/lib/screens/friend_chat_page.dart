@@ -9,6 +9,7 @@ import 'package:provider/provider.dart';
 import '../core/api.dart';
 import '../core/notification_presentation.dart';
 import '../core/calls.dart';
+import '../core/conversation_visibility.dart';
 import '../core/chat_cache.dart';
 import '../core/config.dart';
 import '../core/session.dart';
@@ -34,13 +35,14 @@ class FriendChatPage extends StatefulWidget {
   State<FriendChatPage> createState() => _FriendChatPageState();
 }
 
-class _FriendChatPageState extends State<FriendChatPage> {
+class _FriendChatPageState extends State<FriendChatPage> with ConversationVisibility<FriendChatPage> {
   final _msgs = <Item>[];
   final _text = TextEditingController();
   final _scroll = ScrollController();
   final _voice = VoiceRecorder();
   Timer? _timer, _recTimer;
-  int _last = 0, _recSeconds = 0;
+  int _last = 0, _recSeconds = 0, _readThrough = 0;
+  bool _acknowledging = false;
   bool _loading = false, _sending = false, _first = true, _recording = false;
   String? _path, _fileName;
   Item? _replyTo; // {id, name, preview}
@@ -62,7 +64,8 @@ class _FriendChatPageState extends State<FriendChatPage> {
   @override
   void initState() {
     super.initState();
-    CallManager.I.openChatId = _id; // no pop-up for messages of the chat you are reading
+    _readOnly = widget.friend['former'] == true;
+    _scroll.addListener(_acknowledgeVisible);
     final session = context.read<Session>();
     _cacheAccount = ChatCache.accountKey(AppConfig.apiBase, session.userId, session.token);
     _restore();
@@ -96,11 +99,12 @@ class _FriendChatPageState extends State<FriendChatPage> {
   }
 
   Future<void> _load() async {
-    if (_loading || !mounted || !_cacheReady) return;
+    if (_loading || !conversationVisible || !_cacheReady) return;
+    final epoch = visibilityEpoch;
     _loading = true;
     try {
-      final j = await Api.of(context).getNoCache('friends/$_id/messages', query: {'after': '$_last', if (_since != null) 'since': _since!});
-      if (!mounted) return;
+      final j = await Api.of(context).getNoCache('friends/$_id/messages', query: {'mark_read': '0', 'after': '$_last', if (_since != null) 'since': _since!});
+      if (!conversationVisible || epoch != visibilityEpoch) return;
       _loadError = null;
       if (_first) setState(() => _msgs.clear());
       // messages that were edited or deleted since the last look
@@ -141,6 +145,7 @@ class _FriendChatPageState extends State<FriendChatPage> {
         if (stick) WidgetsBinding.instance.addPostFrameCallback((_) => _toEnd());
       }
       _first = false;
+      afterVisibleFrame(_acknowledgeVisible);
       if (_cacheAccount != null) await ChatCache.write(_cacheAccount, _id, _msgs);
     } catch (_) {
       if (mounted) setState(() => _loadError = 'Could not sync. Showing saved messages.');
@@ -148,6 +153,27 @@ class _FriendChatPageState extends State<FriendChatPage> {
       if (mounted) setState(() {});
       _loading = false;
     }
+  }
+
+  @override
+  void onConversationVisibilityChanged(bool visible) {
+    if (visible) {
+      CallManager.I.openChatId = _id;
+      afterVisibleFrame(() { _load(); _acknowledgeVisible(); });
+    } else if (CallManager.I.openChatId == _id) {
+      CallManager.I.openChatId = null;
+    }
+  }
+
+  Future<void> _acknowledgeVisible() async {
+    if (!conversationVisible || !_nearBottom || _last <= _readThrough || _acknowledging) return;
+    final through = _last;
+    _acknowledging = true;
+    try {
+      await Api.of(context).post('friends/$_id/read', {'through_message_id': through});
+      _readThrough = through;
+    } catch (_) { /* A later visible frame/poll retries; fetching never marks seen. */ }
+    finally { _acknowledging = false; }
   }
 
   void _toEnd() {
@@ -713,7 +739,7 @@ class _FriendChatPageState extends State<FriendChatPage> {
                 alignment: Alignment.centerRight,
                 child: Row(mainAxisSize: MainAxisSize.min, children: [
                   Text('${m['edited'] == true ? 'edited  ' : ''}${m['time']}', style: TextStyle(color: fg.withValues(alpha: 0.7), fontSize: 11)),
-                  if (mine) ...[
+                  if (hasMessageReceipt(m)) ...[
                     const SizedBox(width: 3),
                     Icon(m['status'] == 'sent' || m['status'] == null ? Icons.done_rounded : Icons.done_all_rounded, size: 15, color: m['status'] == 'read' ? const Color(0xFF7DD3FC) : fg.withValues(alpha: 0.7)),
                   ],

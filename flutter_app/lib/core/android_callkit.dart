@@ -3,6 +3,7 @@ import 'dart:io';
 import 'package:flutter_callkit_incoming/flutter_callkit_incoming.dart';
 import 'package:flutter_callkit_incoming/entities/entities.dart';
 import 'package:flutter_secure_storage/flutter_secure_storage.dart';
+import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'calls.dart';
@@ -130,6 +131,16 @@ class AndroidCallKit {
     CallManager.I.incomingAction.value++;
   }
 
+  /// Both foreground-stream delivery while paused and the FCM background isolate
+  /// use the same native notification + fallback path.
+  static Future<void> showWithFallback(Map<String, dynamic> data) async {
+    try {
+      await show(data);
+    } catch (_) {
+      await NotifyService.showIncomingCall(data);
+    }
+  }
+
   static Future<void> show(Map<String, dynamic> data) async {
     final sent = int.tryParse('${data['sent_at']}') ?? DateTime.now().millisecondsSinceEpoch ~/ 1000;
     final remaining = (int.tryParse('${data['ttl']}') ?? 45) * 1000 - (DateTime.now().millisecondsSinceEpoch - sent * 1000);
@@ -149,15 +160,24 @@ class AndroidCallKit {
         ringtonePath: 'tritone', textAccept: 'Accept', textDecline: 'Decline',
         incomingCallNotificationChannelName: 'Incoming calls', missedCallNotificationChannelName: 'Missed calls'),
     ));
-    // The plugin acknowledges the method before its BroadcastReceiver creates the UI.
-    // Keep this isolate alive until the receiver registers the call; otherwise its
-    // internally caught failures never reach the local-notification fallback.
+    // The plugin acknowledges a broadcast before posting its notification, and
+    // can save an active call even when no notification was posted. Check both
+    // records so a silent native failure reaches the fallback.
+    final notificationId = '${data['uuid']}'.codeUnits
+        .fold<int>(0, (hash, unit) => (31 * hash + unit).toSigned(32));
+    final notifications = FlutterLocalNotificationsPlugin()
+        .resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>();
     for (var attempt = 0; attempt < 4; attempt++) {
       await Future<void>.delayed(const Duration(milliseconds: 150));
       final active = await FlutterCallkitIncoming.activeCalls();
-      if (active.any((call) => call.id == data['uuid'])) return;
+      final matching = active.where((call) => call.id == data['uuid']);
+      if (matching.any((call) => call.isAccepted)) return;
+      if (matching.isNotEmpty) {
+        final visible = await notifications?.getActiveNotifications();
+        if (visible?.any((notification) => notification.id == notificationId) == true) return;
+      }
     }
-    throw StateError('Native incoming call was not registered');
+    throw StateError('Native incoming call notification was not posted');
   }
 
   static Future<void> cancel(Map<String, dynamic> data) async {

@@ -7,6 +7,20 @@ class NotificationPresentation {
   final Color color;
   const NotificationPresentation(this.label, this.kind, this.icon, this.color);
 
+  static String systemBody(Map data, String fallback) => switch ('${data['type'] ?? ''}') {
+    'friend_request' => 'Sent you a friend request',
+    'friend_accepted' => 'Accepted your friend request',
+    _ => fallback,
+  };
+
+  static String systemLabel(Map data) => switch ('${data['type'] ?? ''}') {
+    'email_received' || 'new_email' => 'New email',
+    'friend_request' => 'Friend request',
+    'friend_accepted' => 'Friend request accepted',
+    'friend_suggestion' => 'Friend suggestion',
+    _ => NotificationPresentation.from(data).label,
+  };
+
   String action(Map data) => switch ('${data['type'] ?? ''}') {
     'chat' || 'message' || 'contact_reply' => 'sent you a chat',
     'email_received' => 'sent an email',
@@ -63,4 +77,9 @@ class NotificationPresentation {
 }
 
 /// Call/system history entries are events, so delivery ticks do not apply.
-bool hasMessageReceipt(Map message) => message['mine'] == true && !const ['call', 'system'].contains(message['message_kind'] ?? message['kind']);
+bool hasMessageReceipt(Map message) {
+  final kind = '${message['message_kind'] ?? message['kind'] ?? message['type'] ?? ''}'.toLowerCase();
+  // Missing kind on older server previews must not turn a call event into a
+  // delivery receipt. Only recognized outgoing message types have ticks.
+  return message['mine'] == true && const ['text', 'message', 'file', 'voice', 'chat'].contains(kind);
+}

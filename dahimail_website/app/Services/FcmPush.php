@@ -3,11 +3,13 @@
 namespace App\Services;
 
 use App\Models\User;
+use App\Support\PushFailure;
 use Google\Auth\Credentials\ServiceAccountCredentials;
 use Illuminate\Support\Facades\Cache;
 use Illuminate\Support\Facades\DB;
 use Illuminate\Support\Facades\Http;
 use Illuminate\Support\Facades\Log;
+use Psr\Http\Message\RequestInterface;
 
 /**
  * Firebase Cloud Messaging (HTTP v1) – every phone and browser a person is signed in on (table device_tokens).
@@ -26,6 +28,7 @@ use Illuminate\Support\Facades\Log;
 class FcmPush
 {
     private const SCOPE = 'https://www.googleapis.com/auth/firebase.messaging';
+    private bool $skipTokenCache = false;
 
     private function credentialsPath(): ?string
     {
@@ -70,10 +73,31 @@ class FcmPush
         $json = json_decode((string) file_get_contents($this->credentialsPath()), true);
         $project = $json['project_id'] ?? null;
         if (!$project) return null;
-        $access = Cache::remember('fcm_access_token', 3000, function () use ($json) {
+        // The cache is an optimisation: a missing cache table or unavailable
+        // Redis must not prevent an otherwise valid phone from receiving calls.
+        $access = null;
+        try { if (!$this->skipTokenCache) $access = Cache::get('fcm_access_token'); }
+        catch (\Throwable $e) { $this->failure($e, 'token_cache_read'); }
+        if (!$access) {
             $creds = new ServiceAccountCredentials(self::SCOPE, $json);
-            return $creds->fetchAuthToken()['access_token'] ?? null;
-        });
+            // Use the same bounded HTTP transport as delivery. The default
+            // Google auth transport had no deadline and escaped Http::fake().
+            $result = $creds->fetchAuthToken(function (RequestInterface $request) {
+                return Http::connectTimeout(5)->timeout(10)
+                    ->withHeaders($request->getHeaders())
+                    ->withBody((string) $request->getBody(), $request->getHeaderLine('Content-Type'))
+                    ->send($request->getMethod(), (string) $request->getUri())
+                    ->throw()->toPsrResponse();
+            });
+            $access = $result['access_token'] ?? null;
+            if ($access) {
+                $lifetime = min(3000, max(0, (int) ($result['expires_in'] ?? 3600) - 60));
+                if ($lifetime > 0) {
+                    try { Cache::put('fcm_access_token', $access, $lifetime); }
+                    catch (\Throwable $e) { $this->failure($e, 'token_cache_write'); }
+                }
+            }
+        }
         return $access ? ['project' => $project, 'token' => $access] : null;
     }
 
@@ -93,15 +117,52 @@ class FcmPush
     public function probeToken(string $token, string $platform): array
     {
         if (!$this->enabled()) return ['accepted' => false, 'code' => 'server_unconfigured'];
+        $stage = 'authentication';
         try {
             $auth = $this->auth();
             if (!$auth) return ['accepted' => false, 'code' => 'authentication_unavailable'];
+            $stage = 'delivery';
             $message = ['token' => $token, 'data' => ['type' => 'push_connection_check']];
             if ($platform === 'android') $message['android'] = ['priority' => 'HIGH', 'ttl' => '30s'];
             return $this->post($auth, $message, $token, true);
-        } catch (\Throwable) {
-            return ['accepted' => false, 'code' => 'provider_unreachable'];
+        } catch (\Throwable $e) {
+            return $this->failure($e, $stage);
         }
+    }
+
+    /** A real, harmless alert for diagnosing delivery while the app is closed. */
+    public function testToken(string $token, string $platform): array
+    {
+        if (!$this->enabled()) return ['accepted' => false, 'code' => 'server_unconfigured'];
+        try {
+            $auth = $this->auth();
+            if (!$auth) return ['accepted' => false, 'code' => 'authentication_unavailable'];
+            $data = ['type' => 'push_test', 'title' => 'Dahimail push delivery test',
+                'body' => 'This notification arrived from the server.', 'notification_id' => (string) \Illuminate\Support\Str::uuid()];
+            $message = ['token' => $token, 'data' => $data];
+            if ($platform === 'android') {
+                $message['data'] += ['notification_layout' => 'v2', 'category_label' => 'Connection test'];
+                $message['android'] = ['priority' => 'HIGH', 'ttl' => '60s'];
+            } else {
+                $message['notification'] = ['title' => $data['title'], 'body' => $data['body']];
+            }
+            return $this->post($auth, $message, $token);
+        } catch (\Throwable $e) { return $this->failure($e, 'delivery_test'); }
+    }
+
+    private function forgetAccessToken(): void
+    {
+        $this->skipTokenCache = true;
+        try { Cache::forget('fcm_access_token'); }
+        catch (\Throwable $e) { $this->failure($e, 'token_cache_forget'); }
+    }
+
+    private function failure(\Throwable $error, string $stage): array
+    {
+        $code = PushFailure::code($error);
+        // Never log exception messages, HTTP bodies, JWT assertions or tokens.
+        Log::warning('FCM operation failed', ['stage' => $stage, 'code' => $code, 'exception' => get_class($error)]);
+        return ['accepted' => false, 'code' => $code, 'stage' => $stage, 'hint' => PushFailure::hint($code)];
     }
 
     private function post(array $auth, array $message, string $token, bool $validateOnly = false): array
@@ -109,10 +170,10 @@ class FcmPush
         $payload = ['message' => $message];
         if ($validateOnly) $payload['validate_only'] = true;
         for ($attempt = 0; $attempt < 2; $attempt++) {
-            $res = Http::withToken($auth['token'])->timeout(6)->post("https://fcm.googleapis.com/v1/projects/{$auth['project']}/messages:send", $payload);
+            $res = Http::withToken($auth['token'])->connectTimeout(5)->timeout(10)->post("https://fcm.googleapis.com/v1/projects/{$auth['project']}/messages:send", $payload);
             if ($res->status() !== 401 || $attempt === 1) break;
             // Renew and retry this alert; waiting for the next call loses the current invitation.
-            Cache::forget('fcm_access_token');
+            $this->forgetAccessToken();
             $renewed = $this->auth();
             if (!$renewed) break;
             $auth = $renewed;
@@ -124,7 +185,7 @@ class FcmPush
         if ($code === 'UNREGISTERED' && !$validateOnly) {
             DB::table('device_tokens')->where('token', $token)->delete();
         }
-        if ($res->status() === 401) Cache::forget('fcm_access_token');
+        if ($res->status() === 401) $this->forgetAccessToken();
         Log::warning('FCM send rejected', ['http_status' => $res->status(), 'code' => $code, 'validation_only' => $validateOnly]);
         return ['accepted' => false, 'code' => $code];
     }
@@ -139,9 +200,10 @@ class FcmPush
         try {
             $auth = $this->auth();
             if (!$auth) return;
-            $data = $this->strings($data);
+            $data = $this->strings(['recipient_user_id' => $user->id] + \App\Support\PushPresentation::replyTarget($data) + $data);
             [$label, $icon] = \App\Support\PushPresentation::for($data);
-            $body = mb_strimwidth($body, 0, 240, '…');
+            $body = mb_strimwidth(\App\Support\PushPresentation::body($data, $body), 0, 240, '…');
+            $data['body'] = $body;
             $channel = $opts['channel'] ?? 'dm_push';
             foreach ($devices as $d) {
                 try {
@@ -150,11 +212,16 @@ class FcmPush
                         // browsers: the service worker (firebase-messaging-sw.js) shows it, so it must stay data-only + a "webpush" hint
                         $message['data'] += ['title' => $title, 'body' => $body];
                         $message['webpush'] = ['headers' => ['Urgency' => 'high', 'TTL' => (string) ($opts['ttl'] ?? 86400)]];
+                    } elseif (($d->platform ?? '') === 'android' && version_compare(explode('+', $d->app_version ?? '0')[0], '1.0.2', '>=')) {
+                        // v1.0.2+ posts natively before starting Flutter. Data-only
+                        // lets Android show our View/Reply actions consistently.
+                        $message['data'] += ['notification_layout' => 'v2', 'category_label' => $label];
+                        $message['android'] = ['priority' => 'HIGH', 'ttl' => ((int) ($opts['ttl'] ?? 86400)).'s'];
                     } else {
                         $systemTitle = str_starts_with(strtolower($title), strtolower($label)) ? $title : $label.' · '.$title;
                         $hasSender = trim($data['sender_name'] ?? '') !== '';
                         if ($hasSender) $systemTitle = $data['sender_name'];
-                        $systemBody = $hasSender ? \App\Support\PushPresentation::action($data).($body !== '' ? ' · '.$body : '') : $body;
+                        $systemBody = $body;
                         $message['notification'] = ['title' => $systemTitle, 'body' => $systemBody];
                         $message['android'] = [
                             'priority' => 'HIGH',
@@ -163,16 +230,28 @@ class FcmPush
                         ];
                         $message['apns'] = [
                             'headers' => ['apns-priority' => '10', 'apns-push-type' => 'alert'],
-                            'payload' => ['aps' => array_filter(['sound' => 'default', 'thread-id' => $opts['thread'] ?? null, 'mutable-content' => 1])],
+                            'payload' => ['aps' => array_filter(['sound' => 'default', 'thread-id' => $opts['thread'] ?? null, 'mutable-content' => 1, 'category' => isset($data['reply_kind']) ? 'MESSAGE_REPLY' : 'MESSAGE_VIEW'])],
                         ];
+                        if (($d->platform ?? '') === 'ios' && version_compare(explode('+', $d->app_version ?? '0')[0], '1.0.2', '>=')) {
+                            // Match flutter_local_notifications' remote action envelope.
+                            // Firebase opens are ignored for this envelope by the new app.
+                            $message['apns']['payload'] += [
+                                'dm_local_actions' => '1', 'NotificationId' => 1,
+                                'presentAlert' => false, 'presentSound' => false, 'presentBadge' => true,
+                                'payload' => json_encode($message['data'], JSON_UNESCAPED_UNICODE | JSON_THROW_ON_ERROR),
+                            ];
+                            $message['apns']['payload']['aps']['alert'] = [
+                                'title' => $label, 'subtitle' => trim($data['sender_name'] ?? '') ?: $title, 'body' => $body,
+                            ];
+                        }
                     }
                     $this->post($auth, $message, $d->token);
                 } catch (\Throwable $e) {
-                    Log::warning('Push delivery failed for one device', ['platform' => $d->platform ?? 'unknown']);
+                    $this->failure($e, 'device_delivery');
                 }
             }
         } catch (\Throwable $e) {
-            Log::warning('FCM push skipped: ' . $e->getMessage());
+            $this->failure($e, 'notification');
         }
     }
 
@@ -181,22 +260,36 @@ class FcmPush
     /** $data: call_id, caller_id, caller_name, caller_avatar, video, audio_only, meeting, group, uuid … */
     public function sendCall(User $callee, array $data, int $ttl = 45): void
     {
-        if (!$this->enabled() && !app(ApnsVoip::class)->enabled()) return;
+        if (!$this->enabled() && !app(ApnsVoip::class)->enabled()) {
+            Log::warning('Incoming call push unavailable: configure Firebase for Android or APNs VoIP for iOS.', ['user_id' => $callee->id]);
+            return;
+        }
         $devices = $this->devices($callee->id);
-        if (!$devices) return;
-        $data = $this->strings(['type' => 'call', 'ttl' => $ttl] + $data);
+        if (!$devices) {
+            Log::warning('Incoming call push has no registered recipient devices.', ['user_id' => $callee->id]);
+            return;
+        }
+        // Old registrations must not consume the ringing window before the current phone.
+        usort($devices, fn ($a, $b) => strcmp((string) ($b->updated_at ?? ''), (string) ($a->updated_at ?? ''))
+            ?: ((int) $b->id <=> (int) $a->id));
+        $data = $this->strings(['type' => 'call', 'ttl' => $ttl, 'recipient_user_id' => $callee->id] + $data);
         $video = ($data['video'] ?? '0') === '1' && ($data['audio_only'] ?? '0') !== '1';
         $title = $video ? 'Incoming video call' : 'Incoming call';
         $body = ($data['caller_name'] ?? 'Someone') . ' is calling you…';
         try {
             $auth = null;
-            try { $auth = $this->enabled() ? $this->auth() : null; }
-            catch (\Throwable $e) { Log::warning('FCM authentication failed; attempting available native delivery'); }
+            $authAttempted = false;
             foreach ($devices as $d) {
                 try {
                     if (($d->platform ?? '') === 'ios' && !empty($d->voip_token) && app(ApnsVoip::class)->enabled()) {
                         $ok = app(ApnsVoip::class)->send($d->voip_token, $data + ['aps' => ['alert' => $title]], (bool) ($d->apns_sandbox ?? 0), $ttl);
                         if ($ok) continue;                                                       // PushKit delivered → CallKit rings
+                    }
+                    // Native iPhone calls use Apple directly and do not wait for Google login.
+                    if (!$authAttempted) {
+                        $authAttempted = true;
+                        try { $auth = $this->enabled() ? $this->auth() : null; }
+                        catch (\Throwable $e) { $this->failure($e, 'authentication'); }
                     }
                     if (!$auth) continue;
                     if (($d->platform ?? '') === 'ios') {
@@ -217,11 +310,11 @@ class FcmPush
                         $this->post($auth, ['token' => $d->token, 'data' => $data, 'android' => ['priority' => 'HIGH', 'ttl' => $ttl . 's']], $d->token);
                     }
                 } catch (\Throwable $e) {
-                    Log::warning('Push delivery failed for one device', ['platform' => $d->platform ?? 'unknown']);
+                    $this->failure($e, 'device_delivery');
                 }
             }
         } catch (\Throwable $e) {
-            Log::warning('FCM call push skipped: ' . $e->getMessage());
+            $this->failure($e, 'call');
         }
     }
 
@@ -247,11 +340,11 @@ class FcmPush
                     else $m['android'] = ['priority' => 'HIGH', 'ttl' => '30s'];
                     $this->post($auth, $m, $d->token);
                 } catch (\Throwable $e) {
-                    Log::warning('Push delivery failed for one device', ['platform' => $d->platform ?? 'unknown']);
+                    $this->failure($e, 'device_delivery');
                 }
             }
         } catch (\Throwable $e) {
-            Log::warning('FCM silent push skipped: ' . $e->getMessage());
+            $this->failure($e, 'silent');
         }
     }
 }

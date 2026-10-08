@@ -20,6 +20,38 @@ class DeviceEnv {
     return _tz;
   }
 
+  static Future<String?> notificationDiagnostics() async {
+    try {
+      final data = await _ch.invokeMapMethod<String, dynamic>('notificationDiagnostics');
+      if (data == null) return null;
+      return describeNotificationDiagnostics(data);
+    } catch (_) { return null; }
+  }
+
+  static String describeNotificationDiagnostics(Map data) {
+    String importance(dynamic value) => switch (value) {
+      0 => 'Blocked', 1 || 2 => 'Silent', 3 => 'No pop-up banner', 4 || 5 => 'High (banners allowed)', _ => 'Not created yet',
+    };
+    final result = switch (data['last_result']) {
+      'posted_call' => 'Call alert posted to Android',
+      'posted_alert' => 'Message alert posted to Android',
+      'notifications_blocked' => 'Blocked by Android notification permission',
+      'channel_blocked' => 'Blocked by Android notification channel',
+      'muted_in_app' => 'Muted by Dahimail notification preferences',
+      'quiet_hours' => 'Suppressed by quiet hours',
+      'call_expired_or_cancelled' => 'Call arrived expired or already cancelled',
+      'call_cancelled' => 'Caller cancelled the call',
+      'posting_failed' => 'Android notification posting failed',
+      'foreground' => 'Push arrived while Dahimail was on screen',
+      _ => 'No native push result recorded',
+    };
+    return '${data['device'] ?? 'Android'}\nNotifications: ${data['enabled'] == true ? 'Allowed' : 'Blocked'}'
+      '\nIncoming calls channel: ${importance(data['call_importance'])}'
+      '\nLast alert channel: ${importance(data['channel_importance'])}'
+      '\nLast push type: ${data['last_type'] ?? 'none'}\n$result'
+      '\nPosting confirms Android accepted the alert, not that a banner was visible.';
+  }
+
   /// Opens this app's notification page in the phone's settings (falls back to false if unsupported).
   static Future<bool> openNotificationSettings() async {
     try {

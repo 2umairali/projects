@@ -30,6 +30,8 @@ class FriendCallService
         return [
             'id' => (int) $c->id,
             'status' => $c->status,
+            'sent_at' => \Carbon\Carbon::parse($c->created_at, 'UTC')->timestamp,
+            'ttl' => self::RING_SECONDS,
             'group' => (bool) ($c->group_invite ?? 0),
             'audio_only' => (bool) ($c->audio_only ?? 0),
             'role' => $caller ? 'caller' : 'callee',

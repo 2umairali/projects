@@ -41,7 +41,7 @@ class MessageAlerts
                 'email_sent' => 'Email accepted for sending', 'email_delivered' => 'Email delivered',
                 'email_failed' => 'Email could not be sent', 'email_bounced' => 'Email delivery failed', default => 'New email',
             };
-            $recipient->notify(new InAppNotification($title, Str::limit((string) $message->subject, 160), '/inbox?cid='.$conversation->id, 'mail', $type, $message->direction === 'inbound' ? (string) ($message->from_name ?: $message->from_email) : (string) config('app.name')));
+            $recipient->notify(new InAppNotification($title, Str::limit(trim((string) $message->subject.' · '.strip_tags((string) $message->body_text)), 240), '/inbox?cid='.$conversation->id, 'mail', $type, $message->direction === 'inbound' ? (string) ($message->from_name ?: $message->from_email) : (string) config('app.name')));
         } catch (\Throwable $e) {
             // Notification/provider failures cannot turn a successful SMTP send into a retry.
             Log::warning('Message alert unavailable', ['message_id' => $message->id, 'exception' => get_class($e)]);

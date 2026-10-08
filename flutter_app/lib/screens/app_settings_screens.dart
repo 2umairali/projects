@@ -50,7 +50,7 @@ class AppSettingsPage extends StatelessWidget {
     return ListView(padding: const EdgeInsets.fromLTRB(16, 8, 16, 96), children: [
       const SectionHeader('This device'),
       row(Icons.palette_outlined, 'Appearance', switch (prefs.themeMode) { ThemeMode.light => 'Light', ThemeMode.dark => 'Dark', _ => 'Follow system' }, const AppearancePage()),
-      row(Icons.notifications_active_outlined, 'Device notifications', prefs.notifEnabled ? 'On${prefs.quietEnabled ? ' · quiet hours ${AppPrefs.fmtMinutes(prefs.quietStart)}–${AppPrefs.fmtMinutes(prefs.quietEnd)}' : ''}' : 'Off', const DeviceNotificationsPage()),
+      row(Icons.notifications_active_outlined, 'Device notifications', prefs.notifEnabled ? 'On · ${NotifSound.labelOf(prefs.soundId)}' : 'Off', const DeviceNotificationsPage()),
       row(Icons.lock_outline_rounded, 'App lock', lock.enabled ? 'App lock on · ${AppLock.timeouts[lock.timeoutSeconds] ?? ''}' : 'App lock off', const AppLockPage(), pageTitle: 'App lock'),
       row(Icons.verified_user_outlined, 'Permissions', 'Notifications, camera, biometrics', const PermissionsPage()),
       row(Icons.storage_rounded, 'Storage', 'Saved emails and pictures on this phone', const StoragePage()),
@@ -95,7 +95,7 @@ class DeviceNotificationsPage extends StatefulWidget {
 class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with WidgetsBindingObserver {
   bool? _allowed;
   bool? _fullScreen;
-  String? _lastPush;
+  String? _lastPush, _deliveryDetails;
 
   @override
   void initState() {
@@ -119,7 +119,20 @@ class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with 
     final a = await NotifyService.I.allowed();
     final fullScreen = await DeviceEnv.canFullScreenIntent();
     final lastPush = await PushReceipt.lastReceived();
-    if (mounted) setState(() { _allowed = a; _fullScreen = fullScreen; _lastPush = lastPush; });
+    final details = await DeviceEnv.notificationDiagnostics();
+    if (mounted) setState(() { _allowed = a; _fullScreen = fullScreen; _lastPush = lastPush; _deliveryDetails = details; });
+  }
+
+  Future<void> _batterySettings(BuildContext context) async {
+    if (Platform.isAndroid && await NativeCalls.openBatterySettings()) return;
+    if (!context.mounted) return;
+    await showDialog<void>(context: context, builder: (context) => AlertDialog(
+      title: const Text('Background battery settings'),
+      content: Text(Platform.isIOS
+          ? 'On your iPhone, open Settings → Battery to manage Low Power Mode. Notification and call permissions are managed in Settings → Apps → Dahimail.'
+          : 'Open your phone settings, choose Apps → Dahimail → Battery, and allow background activity. On Xiaomi, also allow Autostart and lock-screen notifications in the app settings.'),
+      actions: [TextButton(onPressed: () => Navigator.pop(context), child: const Text('Done'))],
+    ));
   }
 
   Future<void> _allow() async {
@@ -203,21 +216,22 @@ class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with 
             await PushService.I.checkConnection(Api.of(context));
             await _check();
           }, icon: const Icon(Icons.sync_rounded), label: Text(status.busy ? 'Checking…' : 'Check connection')),
+          if (_deliveryDetails != null) Padding(padding: const EdgeInsets.only(top: 12), child: SelectableText(_deliveryDetails!, style: Theme.of(context).textTheme.bodySmall)),
           if (Platform.isAndroid) ...[
             ListTile(contentPadding: EdgeInsets.zero, title: const Text('Incoming calls on lock screen'),
               subtitle: Text(_fullScreen == true ? 'Allowed' : 'Permission needed for full-screen calls'),
               trailing: const Icon(Icons.open_in_new), onTap: DeviceEnv.openFullScreenIntentSettings),
-            TextButton.icon(onPressed: NativeCalls.openBatterySettings, icon: const Icon(Icons.battery_charging_full_rounded), label: const Text('Background battery settings')),
           ],
+          TextButton.icon(onPressed: () => _batterySettings(context), icon: const Icon(Icons.battery_charging_full_rounded), label: const Text('Background battery settings')),
         ])),
       ),
       const SectionHeader('Show notifications'),
       AppCard(padding: EdgeInsets.zero, child: Column(children: [
-        sw('n_enabled', p.notifEnabled, 'Notifications on this device', sub: 'Alerts appear when the app is in the background'),
+        sw('n_enabled', p.notifEnabled, 'Notifications on this device', sub: 'Message, email and activity alerts on this phone'),
       ])),
       const SectionHeader('What to show'),
       AppCard(padding: EdgeInsets.zero, child: Column(children: [
-        sw('n_messages', p.notifMessages, 'New messages', sub: 'Conversations and replies', enabled: on),
+        sw('n_messages', p.notifMessages, 'New messages', sub: 'Chats, emails, friend requests and replies', enabled: on),
         sw('n_activity', p.notifActivity, 'Activity', sub: 'Assignments, mentions, campaigns, workflows', enabled: on),
         sw('n_billing', p.notifBilling, 'Billing', sub: 'Payments and plan alerts', enabled: on),
       ])),
@@ -236,7 +250,7 @@ class _DeviceNotificationsPageState extends State<DeviceNotificationsPage> with 
       ])),
       const SectionHeader('Quiet hours'),
       AppCard(padding: EdgeInsets.zero, child: Column(children: [
-        sw('q_enabled', p.quietEnabled, 'Do not disturb on a schedule', sub: 'No alerts during these hours', enabled: on),
+        sw('q_enabled', p.quietEnabled, 'Do not disturb on a schedule', sub: 'Mute message, email and activity alerts; incoming calls still ring', enabled: on),
         ListTile(enabled: on && p.quietEnabled, title: const Text('From'), trailing: Text(AppPrefs.fmtMinutes(p.quietStart), style: const TextStyle(fontWeight: FontWeight.w700)), onTap: () => _pickTime(p, true)),
         ListTile(enabled: on && p.quietEnabled, title: const Text('Until'), trailing: Text(AppPrefs.fmtMinutes(p.quietEnd), style: const TextStyle(fontWeight: FontWeight.w700)), onTap: () => _pickTime(p, false)),
       ])),

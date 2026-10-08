@@ -53,3 +53,116 @@ Build the Flutter app from the committed lockfile (Flutter 3.44+/Dart 3.12+).
 Use two real accounts and signed Android/iOS devices. Check foreground/background/locked/swipe-away calls, native accept/decline, expired calls, calls while another app is open, fresh login while offline followed by reconnect, and token rotation. Check incoming mail, failed sends, a provider bounce, friend request/accept/reject, meeting invitation and chat alerts in every app state. With two web sessions, verify list previews, unread decreases, request badges, open notification-center contents, and updates after reconnect without reloading. Confirm that a non-member cannot authorize a workspace channel.
 
 The sandbox tests simulate providers and native method channels. They do not certify production FCM/APNs transport, device notification permissions, iOS compilation, or physical audio routing.
+
+
+## When the phone says the website could not reach Firebase
+
+This is a server-side check failure; changing the Android overlay permission cannot repair it. Older builds used this message for every exception, including rejected Google credentials and local cache errors. The updated server separates these failures and continues delivery if only the token cache is unavailable.
+
+After uploading the updated website files, run from the Laravel application directory:
+
+```sh
+composer install --no-dev --optimize-autoloader
+php artisan config:clear
+php artisan push:status --user=123 --probe
+```
+
+Replace `123` with the affected signed-in user's ID. Run with the same PHP version and environment as the website. The probe prints no device tokens or private keys. It validates the selected user's registrations **without sending an alert**, so a successful probe alone will not update “Last push handled by the app.” Check a real call/message afterwards.
+
+The output identifies the failing stage (`authentication` or `delivery`) and a repair hint:
+
+- `provider_dns_error`: repair hosting DNS for `oauth2.googleapis.com` and `fcm.googleapis.com`.
+- `provider_connection_refused` / `provider_timeout`: ask the host to allow outbound HTTPS on port 443 to both hosts, and check proxy and IPv4/IPv6 routing.
+- `provider_tls_error`: update the server CA trust bundle and the active PHP `curl.cainfo` / `openssl.cafile` settings. Keep TLS certificate verification enabled.
+- `authentication_rejected`: check that the service-account key is active, its account is enabled, and the server clock is correct. Use the matching Firebase project's key; do not share the JSON file.
+- `PERMISSION_DENIED`: verify Firebase Cloud Messaging API (HTTP v1) is enabled and the service account has permission to send messages in that project.
+- `push_server_error`: inspect the `FCM operation failed` log entry and install the committed Composer dependencies. The entry includes only stage, safe error code and exception class.
+
+If the token cache is broken, logs identify `token_cache_read`, `token_cache_write` or `token_cache_forget`. Repair the configured cache store; the push path now obtains a fresh Google token without requiring a working cache.
+
+After a successful probe, place a call while the receiver uses another app, then repeat with the phone locked and with the app swiped away. A phone explicitly force-stopped through Android Settings must be reopened first. The app update provides the same specific error explanations in Settings → Notifications; the server CLI can diagnose the problem before rebuilding the app.
+
+## Phone notification update: 1.0.3+4
+
+Deploy the server files and rebuild/install Flutter **1.0.3+4**. Uploading PHP files alone cannot add the Android receiver or notification actions to an already installed app. Preserve production `.env`, Firebase credentials, `google-services.json`, and signing keys. Build the release with the same application ID and signing key as the installed app. After installing, open Dahimail and sign in once so the new version and FCM token are registered. Older Android versions keep the previous visible-push format until they upgrade.
+
+Android incoming calls are posted by `NativePushReceiver` immediately on FCM receipt, before a Flutter engine starts. In 1.0.3+4 the full-screen intent opens a dedicated native `IncomingCallActivity`, showing the brand, caller name/avatar, call type and red Decline/green Answer controls. It does not wait for the Flutter splash screen, login gate or call poll to display the incoming call. They use the high-importance Incoming calls channel with Accept/Decline, a full-screen intent, ringtone, badge and lights where supported. Stale invitations and invitations cancelled before arrival cannot ring. Caller cancellation closes the native screen immediately. Decline dismisses ringing locally and sends a callee-authorized request through the background callback; Answer opens the app to join the call. Call alerts expire at their original deadline; moving an already-ringing app into the background retains that deadline. The receiver passes the message to FlutterFire with a marker to suppress duplicate alerts. A foreground service alone does not count as an open app.
+
+New Android clients receive data-only message alerts, rendered natively with the brand icon, category, full sender name, body preview, optional sender avatar, View and inline Reply. These are the phone system notifications, including the heads-up banner and notification shade. Android/iOS determine the final system layout, lock-screen privacy, heads-up duration, badges and LED behavior; an app cannot force identical placement across phone manufacturers. iOS 1.0.2+3 registers View/Reply categories and the background action plugin callback. Its remote action envelope routes through flutter_local_notifications without a second Firebase navigation. iOS native compilation/device checks require a macOS host.
+
+Reply is available only for incoming chat/email messages. It uses the signed-in recipient's stored token and fixed authorized API endpoints. Missed calls and delivery/status events have View only. Failed or uncertain sends keep the draft and show “Reply not confirmed”; open the conversation before retrying. Notifications for a different signed-in account cannot send a reply. Incoming email previews include subject and available body text; header-only sync notifications show the subject until message content is available. Email senders without a supplied profile picture use the app's avatar fallback.
+
+Unfriending retains existing messages and conversation access for both users, including teammates. Sending is blocked until friendship is accepted again. Re-requesting, declining or cancelling a renewed request does not erase the former-friend history marker. The app shows its existing “no longer friends” read-only composer notice. Call/system entries never display message-delivery ticks.
+
+### Deployment and phone verification
+
+1. Merge the `dahimail_website/` files into the Laravel project root (for this server: `/home/dahimail.com/public_html`). Run `php artisan optimize:clear` and restart existing queue workers with `php artisan queue:restart`.
+2. Merge `flutter_app/` into the Flutter source project. Run `flutter pub get`, then build a signed release APK/App Bundle using the existing project configuration and signing key. Install the updated app; do not upload Flutter source into the web document root.
+3. Open Device notifications in the app. Allow notifications, the Incoming calls channel, and “Incoming calls on lock screen”/full-screen notifications on Android 14+. Enable heads-up/lock-screen display in the phone's channel settings. Some manufacturers also require allowing background/autostart activity.
+4. With two accounts, test an incoming audio/video call while the recipient app is foregrounded, backgrounded, swiped away, and while the phone is locked. Confirm Accept joins, Decline rejects, and caller cancellation removes the alert. Test switching away during ringing. Force-stop in Android Settings suppresses FCM until the app is reopened; it is different from swiping away.
+5. Send a chat and email. Check category/name/preview/avatar; use View and inline Reply. Unfriend and confirm both users can still read history but cannot send, including from an older notification's Reply button. Confirm missed calls have no ticks or Reply button.
+
+Local automated tests and APK compilation do not prove delivery on a physical phone. Real FCM receipt, manufacturer restrictions, lock-screen presentation and iOS PushKit/APNs credentials must be checked on the deployed app. iPhone closed-app call screens still require the existing APNs VoIP configuration; Firebase credentials alone do not provide PushKit calls.
+
+### System behavior for 1.0.3+4
+
+- While another app is open: Android's high-priority incoming-call banner has Answer/Decline; tapping it opens the native incoming-call screen. Android controls whether a full-screen intent interrupts an unlocked screen.
+- Phone locked or screen off: Android can wake and display the dedicated full-screen call Activity when full-screen call notifications are allowed. Without that permission it presents the permitted notification UI.
+- App process stopped by the OS or swiped away: FCM can trigger the native receiver and call screen without opening the Flutter UI first. Android Settings → Force stop, disabled notifications, DND rules or manufacturer background restrictions can prevent this.
+- Message/email notifications: high-importance system channels, brand icon, category, sender name, content preview, optional sender avatar, View and Reply. Android 6/7 now receive explicit sound/vibration defaults as well as high priority; channel settings govern newer Android versions.
+- The incidental in-app notification tile/notification-center redesign from the 1.0.2 ZIP has been restored to its original UI. The new source ZIP includes those restored files so an earlier installation of that ZIP can be corrected.
+
+Test with the recipient phone locked, while another app is visible, and after swiping Dahimail away. Record the installed app version, phone model and Android version if a banner or call screen is still missing. A Firebase provider probe only verifies server acceptance; it does not prove that the phone displayed an alert.
+
+### Android delivery evidence and minimized-chat receipts (1.0.4+5)
+
+Mobile conversation GET requests no longer mark messages read. The rebuilt app sends a bounded `through_message_id` acknowledgement only after rendering the active conversation while resumed and unlocked. Switching apps or covering the route invalidates pending display callbacks and stale fetch responses. Friend acknowledgements cannot include another conversation, private records, cleared history, or messages arriving after the displayed snapshot. Inbox acknowledgements leave the conversation unread if a newer message exists. Existing web behavior and explicit manual mark-as-read remain available. Deploy both PHP and the rebuilt app: older mobile builds do not send the new friend read acknowledgement.
+
+`push:status --probe` is provider validation only. To send an actual harmless test notification to user 14's registered devices:
+
+```bash
+php artisan push:status --user=14 --test
+```
+
+Use the recipient's database user ID. The options `--test` and `--probe` are mutually exclusive, and both require `--user`. The test contains no private message content. Firebase acceptance does not prove phone receipt or that a banner was shown.
+
+Install/open 1.0.4+5 and sign in, then minimize it and run the test. Reopen Settings → Device notifications → Check connection and copy the Android delivery summary. It distinguishes no native receipt, foreground receipt, notification permission/channel blocking, Dahimail mute/quiet hours, expired calls and successful posting to Android. It also reports channel importance: a channel below High cannot produce normal heads-up banners. Check full-screen intent permission separately in that page. Send this summary with the command output, installed version, phone model/Android version and whether the app was swiped away or force-stopped. Do not send credentials or device tokens.
+
+Actual locked/background/swiped-away push delivery and call presentation still require physical-phone verification. Force stop in Android Settings suspends delivery until the app is opened again. A source ZIP or a PHP deployment alone cannot update the installed app.
+
+### Notification layout and streamlined settings (1.0.5+6)
+
+Phone alerts now use category → sender full name → content. Android uses a decorated native notification with the Dahimail logo on the left, a small category heading, sender and message underneath, and avatar on the right. The expanded alert keeps View and Reply for supported conversations. Friend events say “Sent you a friend request” or “Accepted your friend request.” iOS uses its native app icon, title/category, subtitle/sender and body; actions are available through the system notification. Font sizes, full-screen versus heads-up presentation and lock-screen privacy remain controlled by Android/iOS.
+
+In 1.0.5+6, Device notifications was reduced to Background battery settings (superseded by 1.0.7+8 below). Removed connection diagnostics, local test button, sound/category toggles and quiet-hours controls. Retired local preferences are cleared on app startup, so hidden toggles cannot mute new alerts; OS notification permission, channels, Focus/DND and per-account server preferences still apply. Android opens battery settings; iOS shows directions to Battery in system Settings because iOS provides no public battery-settings deep link. Required OS permissions remain available under Permissions and during sign-in.
+
+Incoming calls prioritize registrations updated most recently so old device requests are less likely to consume the ringing window. Native iOS PushKit delivery no longer waits for Firebase authentication. iOS still requires valid APNS_* configuration, PushKit registration and a correctly signed app; Firebase alone cannot wake an iPhone into CallKit.
+
+The supplied Xiaomi Android12 screenshot showed a local test banner, missing/invalid Firebase credentials, no remote push receipt and no incoming-call channel. A local banner does not establish remote call delivery. After server deployment, an administrator must verify that FIREBASE_CREDENTIALS points to a valid JSON file readable by the PHP web process (keep it outside public_html), clear stale Laravel config, and run:
+
+```bash
+php artisan optimize:clear
+php artisan queue:restart
+php artisan push:status --user=14 --probe
+php artisan push:status --user=14 --test
+```
+
+Use the recipient's actual user ID. The test is a harmless message notification, not a synthetic call. Then place a real call from another account while the recipient phone is locked and while another app is open. Check Xiaomi Autostart, battery/background activity and lock-screen notification permissions if Firebase accepts delivery but the phone remains silent. No physical Android/iOS call delivery has been verified in this sandbox. The 1.0.4 instructions to copy diagnostics from Device notifications are superseded by this simplified page; troubleshooting is administrator work.
+
+### Native Firebase service for background Android calls (1.0.6+7)
+
+Data-only delivery now enters `NativeMessagingService.onMessageReceived`, the Android Firebase service callback. It posts the native incoming-call alert before passing the message to Flutter. The former FlutterFire service callback intentionally did nothing and relied on a separate broadcast receiver; this update makes the service responsible for calls and v2 message alerts. The broadcast receiver is retained only for legacy notification-payload tap bookkeeping, avoiding duplicate data processing. Firebase token-refresh handling is inherited from FlutterFire.
+
+A failing Flutter handoff no longer aborts delivery after native posting. Repeated call pushes do not extend an existing ringing deadline. Cancellation marks the call closed before Flutter starts, so a delayed invitation cannot ring after cancellation. The native caller screen still uses Android's high-importance full-screen call notification; a locked phone may open the full screen, while an unlocked phone normally receives an actionable call banner. DND, notification channels, Android14+ full-screen permission and manufacturer restrictions remain enforced by the phone.
+
+Rebuild and install **1.0.6+7** with the existing Firebase project, application ID and signing key. This change cannot reach a phone through a PHP-only deployment. Open/sign in once after installing, then verify a real call while minimized, after swiping the app from Recents, while another app is open and with the screen locked. For the reported Xiaomi device, allow Autostart, background battery activity and lock-screen/background pop-up notifications in system app settings. Android Settings → Force stop puts the app in a stopped state and blocks FCM until it is manually reopened; no app-side change can guarantee incoming calls in that state.
+
+The server must still accept the recipient's current FCM token and send an incoming call before it expires. A local notification test proves neither server delivery nor a working call push. Use the existing administrator `push:status --user=<recipient-id> --test` for actual remote notification delivery, then place a real call. Never infer phone receipt from Firebase acceptance alone.
+
+### All Device notifications options restored (1.0.7+8)
+
+Profile settings → Device notifications again includes connection status and Check connection, last remote push receipt, notification permission recovery, notification enable/category controls, sound selection and preview, vibration, sound while the app is open, quiet hours and From/Until times, and the local notification display test. Android also shows native delivery details and lock-screen incoming-call permission. Background battery settings remains on both platforms, with iPhone system Settings guidance.
+
+Saved device preferences now survive app startup. Android's native message/email/activity path observes the restored enable/category/quiet-hours/sound/vibration controls while preserving the decorated banners and View/Reply actions. Incoming calls retain their urgent native path; the message alert controls and quiet hours do not silence ringing calls. OS permissions, notification channels and Focus/DND still apply. iOS remote alerts are presented by the OS using the server payload; device controls apply to alerts generated by the app. Settings erased by an earlier version cannot be recovered and start with defaults.
+
+The local display test does not verify Firebase delivery. Check connection validates server/provider registration, and the last-push timestamp and Android diagnostics provide receipt evidence. Verify real message and call delivery from another account after rebuilding and installing 1.0.7+8. This restoration supersedes the earlier instruction that Device notifications diagnostics were removed.

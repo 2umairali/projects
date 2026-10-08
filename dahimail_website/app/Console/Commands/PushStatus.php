@@ -10,8 +10,8 @@ use Illuminate\Support\Facades\Schema;
 
 class PushStatus extends Command
 {
-    protected $signature = 'push:status {--user= : Show device counts for one user ID} {--probe : Validate that user’s device tokens with FCM without delivering alerts}';
-    protected $description = 'Check local push configuration and registrations without sending notifications or displaying tokens';
+    protected $signature = 'push:status {--user= : Show device counts for one user ID} {--probe : Validate that user’s device tokens with FCM without delivering alerts} {--test : Send a real push delivery test to that user’s devices}';
+    protected $description = 'Check push configuration; optionally validate tokens or send a real delivery test';
 
     public function handle(FcmPush $fcm, ApnsVoip $apns): int
     {
@@ -20,8 +20,12 @@ class PushStatus extends Command
             $this->error('--user must be a positive user ID.');
             return self::INVALID;
         }
-        if ($this->option('probe') && $user === null) {
-            $this->error('--probe requires --user to select whose devices to validate.');
+        if (($this->option('probe') || $this->option('test')) && $user === null) {
+            $this->error('--probe and --test require --user to select whose devices to check.');
+            return self::INVALID;
+        }
+        if ($this->option('probe') && $this->option('test')) {
+            $this->error('Choose --probe or --test, not both.');
             return self::INVALID;
         }
         $error = $fcm->configurationError();
@@ -38,14 +42,17 @@ class PushStatus extends Command
                 ->groupBy('platform')->when($version !== 'NULL', fn ($q) => $q->groupBy('app_version'))->get();
             $this->table(['Platform', 'App version', 'Devices', 'With VoIP token'], $rows->map(fn ($r) => [$r->platform, $r->version ?? 'unknown', $r->devices, $r->voip_devices])->all());
             if ($rows->isEmpty()) $this->warn('No registered devices. Sign in with the rebuilt app and check registration again.');
-            if ($this->option('probe') && $error === null) {
+            if (($this->option('probe') || $this->option('test')) && $error === null) {
                 $failed = false;
                 foreach (DB::table('device_tokens')->where('user_id', (int) $user)->get() as $device) {
-                    $result = $fcm->probeToken($device->token, $device->platform);
+                    $result = $this->option('test') ? $fcm->testToken($device->token, $device->platform) : $fcm->probeToken($device->token, $device->platform);
                     $this->line("Device {$device->id} ({$device->platform}): {$result['code']}");
+                    if (isset($result['hint'])) $this->warn(($result['stage'] ?? 'push').': '.$result['hint']);
                     $failed = $failed || !$result['accepted'];
                 }
-                $this->line('Provider validation only; no notification was sent. Device receipt still needs a real call/message.');
+                $this->line($this->option('test')
+                    ? 'Real test sent to Firebase. Accepted does not confirm phone receipt. Reopen Device notifications to check the last Android delivery result.'
+                    : 'Provider validation only; no notification was sent. Device receipt still needs a real call/message.');
                 return $failed || $rows->isEmpty() ? self::FAILURE : self::SUCCESS;
             }
         } catch (\Throwable) {

@@ -223,8 +223,9 @@ class InboxApiController extends Controller
 
         if (!$conversation) return response()->json(['error' => 'Not found'], 404);
 
-        // Mark as read
-        $conversation->update(['is_read' => true]);
+        // Mobile fetches may finish after the app has been minimized.
+        // Its visible screen sends a separate bounded read acknowledgement.
+        if (!$request->is('api/*') && $request->boolean('mark_read', true)) $conversation->update(['is_read' => true]);
 
         // Auto-fetch missing bodies for IMAP messages when user opens conversation
         $hasPendingBodies = Message::where('conversation_id', $conversation->id)
@@ -549,6 +550,16 @@ class InboxApiController extends Controller
             : Conversation::where('workspace_id', $workspaceId);
 
         $conv = $base->findOrFail($id);
+
+        if ($action === 'mark_read' && $request->has('through_message_id')) {
+            $data = $request->validate(['through_message_id' => 'required|integer|min:1']);
+            $through = (int) $data['through_message_id'];
+            abort_unless($conv->messages()->whereKey($through)->exists(), 422, 'Message is not in this conversation.');
+            // Atomic guard: a message arriving after the fetched snapshot stays unread.
+            Conversation::whereKey($conv->id)->whereDoesntHave('messages', fn ($q) => $q->where('id', '>', $through))
+                ->update(['is_read' => true]);
+            return response()->json(['message' => 'Read receipt saved.']);
+        }
 
         match ($action) {
             'star' => $conv->update(['is_starred' => !$conv->is_starred]),

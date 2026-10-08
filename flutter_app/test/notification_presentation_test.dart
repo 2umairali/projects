@@ -24,6 +24,8 @@ void main() {
   test('call events never show delivery ticks but outgoing messages retain them', () {
     expect(hasMessageReceipt({'mine': true, 'message_kind': 'call', 'status': 'read'}), false);
     expect(hasMessageReceipt({'mine': true, 'kind': 'system'}), false);
+    expect(hasMessageReceipt({'mine': true, 'type': 'missed_call', 'status': 'read'}), false);
+    expect(hasMessageReceipt({'mine': true, 'preview': 'Missed call', 'status': 'read'}), false);
     expect(hasMessageReceipt({'mine': true, 'message_kind': 'text', 'status': 'read'}), true);
     expect(hasMessageReceipt({'mine': false, 'message_kind': 'text'}), false);
   });

@@ -45,6 +45,8 @@ android {
         }
     }
 
+    testOptions { unitTests.isIncludeAndroidResources = true }
+
     buildTypes {
         release {
             signingConfig = if (keystoreFile.exists()) signingConfigs.getByName("release") else signingConfigs.getByName("debug")
@@ -59,6 +61,13 @@ kotlin {
 }
 
 dependencies {
+    // The native FCM service uses the same Firebase BOM as the locked FlutterFire plugins.
+    val flutterFire = rootProject.findProperty("FlutterFire") as? Map<*, *>
+    val firebaseSdk = flutterFire?.get("FirebaseSDKVersion") ?: rootProject.project(":firebase_core").property("FirebaseSDKVersion")
+    implementation(platform("com.google.firebase:firebase-bom:$firebaseSdk"))
+    implementation("com.google.firebase:firebase-messaging")
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
     coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.5")
     // AppCompat themes are needed by the fingerprint / face prompt
     implementation("androidx.appcompat:appcompat:1.7.0")
@@ -68,4 +77,10 @@ dependencies {
 
 flutter {
     source = "../.."
+}
+
+// Flutter copies assets after AGP's merge task. Resource-aware unit tests must
+// wait for that copy too (Gradle 9 validates these task dependencies).
+tasks.matching { it.name == "packageDebugUnitTestForUnitTest" }.configureEach {
+    dependsOn("copyFlutterAssetsDebug")
 }

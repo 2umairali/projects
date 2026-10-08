@@ -17,6 +17,8 @@ void main() {
     SharedPreferences.setMockInitialValues({});
     SharedPreferencesAsyncPlatform.instance = InMemorySharedPreferencesAsync.empty();
     shown.clear();
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('com.dahify.dahimail/device'), (_) async => false);
     TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(channel, (call) async {
       if (call.method == 'show') shown.add(call);
       if (call.method == 'getNotificationAppLaunchDetails') return {'notificationLaunchedApp': false};
@@ -41,9 +43,33 @@ void main() {
     expect(shown, isEmpty);
   });
 
-  test('disabled notification categories suppress local push alerts', () async {
+  test('disabled messages category suppresses email alerts', () async {
     SharedPreferences.setMockInitialValues({'n_messages': false});
     await NotifyService.I.showRemote({'type': 'email_received', 'title': 'New email'});
     expect(shown, isEmpty);
   });
+
+  test('Android foreground fallback alerts use the same native banner without duplicates', () async {
+    final native = <MethodCall>[];
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger.setMockMethodCallHandler(
+      const MethodChannel('com.dahify.dahimail/device'), (call) async { native.add(call); return true; });
+    await NotifyService.I.showRemote({'type': 'friend_request', 'title': 'Request', 'sender_name': 'Alice Example', 'notification_id': 'native-1'});
+    expect(native.single.method, 'showSystemAlert');
+    expect(native.single.arguments['category_label'], 'Friend request');
+    expect(native.single.arguments['sender_name'], 'Alice Example');
+    expect(native.single.arguments['body'], 'Sent you a friend request');
+    expect(shown, isEmpty);
+  });
+
+  test('iOS local notification uses category then full name then message body', () async {
+    debugDefaultTargetPlatformOverride = TargetPlatform.iOS;
+    IOSFlutterLocalNotificationsPlugin.registerWith();
+    await NotifyService.I.showRemote({'type': 'email_received', 'title': 'Email', 'sender_name': 'Alice Example', 'body': 'The email preview', 'notification_id': 'ios-1'});
+    final args = shown.single.arguments as Map;
+    expect(args['title'], 'New email');
+    expect(args['body'], 'The email preview');
+    expect(args['platformSpecifics']['subtitle'], 'Alice Example');
+    expect(args['platformSpecifics']['categoryIdentifier'], 'MESSAGE_VIEW');
+  });
+
 }

@@ -115,7 +115,7 @@ class FriendService
             })->filter()->values()->all();
 
         // people you were friends with: the chat stays readable, the dates stay visible
-        $former = FriendRequest::with(['requester', 'addressee'])->where('status', 'unfriended')
+        $former = FriendRequest::with(['requester', 'addressee'])->where('status', '!=', 'accepted')->where(fn ($q) => $q->where('status', 'unfriended')->orWhereNotNull('unfriended_at'))
             ->where(fn ($q) => $q->where('requester_id', $u->id)->orWhere('addressee_id', $u->id))->latest('unfriended_at')->get()
             ->map(function ($r) use ($u, $unread) {
                 $o = $r->requester_id === $u->id ? $r->addressee : $r->requester;
@@ -154,7 +154,7 @@ class FriendService
 
         RateLimiter::hit($limiter, 86400);
         if ($former) {
-            $former->update(['requester_id' => $from->id, 'addressee_id' => $toId, 'status' => 'pending', 'responded_at' => null, 'unfriended_at' => null, 'unfriended_by' => null]);
+            $former->update(['requester_id' => $from->id, 'addressee_id' => $toId, 'status' => 'pending']);
         } else {
             FriendRequest::create(['requester_id' => $from->id, 'addressee_id' => $toId, 'status' => 'pending']);
         }
@@ -192,7 +192,11 @@ class FriendService
     public function cancel(User $u, int $id): array
     {
         $r = FriendRequest::where('id', $id)->where('requester_id', $u->id)->where('status', 'pending')->first();
-        $n = $r?->delete();
+        // A renewed request must not erase the relationship that grants access
+        // to existing messages. Only first-time pending requests are deleted.
+        $n = $r && $r->unfriended_at
+            ? $r->update(['status' => 'unfriended'])
+            : $r?->delete();
         return $n ? [true, 'Request cancelled.'] : [false, 'This request is no longer available.'];
     }
 

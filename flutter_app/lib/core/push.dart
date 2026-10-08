@@ -19,18 +19,14 @@ Future<void> firebaseBackgroundHandler(RemoteMessage message) async {
   await Firebase.initializeApp();
   final t = message.data['type'];
   await PushReceipt.received();
-  if (Platform.isAndroid && t == 'call') {
+  if (Platform.isAndroid && t == 'call' && message.data['dm_native_shown'] != '1') {
     // a call that is already too old (phone was off / no network) must not ring: it would only be a "ghost" call
     final sent = int.tryParse('${message.data['sent_at'] ?? ''}');
     final ttl = int.tryParse('${message.data['ttl'] ?? ''}') ?? 45;
     if (sent != null && DateTime.now().millisecondsSinceEpoch ~/ 1000 - sent > ttl) return;
-    try {
-      await AndroidCallKit.show(Map<String, dynamic>.from(message.data));
-    } catch (_) {
-      await NotifyService.showIncomingCall(Map<String, dynamic>.from(message.data));
-    }
+    await AndroidCallKit.showWithFallback(Map<String, dynamic>.from(message.data));
   }
-  if (t != 'call' && t != 'call_cancel' && message.notification == null) {
+  if (t != 'call' && t != 'call_cancel' && message.notification == null && message.data['dm_native_shown'] != '1') {
     await NotifyService.I.showRemote(message.data, messageId: message.messageId);
   }
   if (Platform.isAndroid && t == 'call_cancel') {
@@ -69,9 +65,8 @@ class PushService with WidgetsBindingObserver {
       AppRefresh.bump();
       final type = m.data['type'];
       if (type == 'call') {
-        if (Platform.isAndroid && NotifyService.I.state != AppLifecycleState.resumed) {
-          try { await AndroidCallKit.show(m.data); }
-          catch (_) { await NotifyService.showIncomingCall(m.data); }
+        if (Platform.isAndroid && NotifyService.I.state != AppLifecycleState.resumed && m.data['dm_native_shown'] != '1') {
+          await AndroidCallKit.showWithFallback(m.data);
         }
         CallManager.I.incomingPush(m.data);
       } else if (type == 'call_cancel') {
@@ -82,6 +77,7 @@ class PushService with WidgetsBindingObserver {
         CallManager.I.pollNow();
       } else {
         if (type == 'chat' || type == 'missed_call') CallManager.I.pollNow();
+        if (m.data['dm_native_shown'] == '1') return;
         try { await NotifyService.I.showRemote({
           ...m.data,
           if (m.data['title'] == null && m.notification?.title != null) 'title': m.notification!.title!,
@@ -93,9 +89,11 @@ class PushService with WidgetsBindingObserver {
       _token = token;
       if (_api != null) register(_api!);
     });
-    FirebaseMessaging.onMessageOpenedApp.listen((_) => NotifyService.I.tapped.value++);
+    FirebaseMessaging.onMessageOpenedApp.listen((m) {
+      if (m.data['dm_local_actions'] != '1') NotifyService.I.openRemote(m.data);
+    });
     FirebaseMessaging.instance.getInitialMessage().then((first) {
-      if (first != null) NotifyService.I.tapped.value++;
+      if (first != null && first.data['dm_local_actions'] != '1') NotifyService.I.openRemote(first.data);
     }).catchError((_) {});
   }
 

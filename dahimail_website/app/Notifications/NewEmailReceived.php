@@ -30,6 +30,7 @@ class NewEmailReceived extends Notification
     {
         return [
             'type' => 'new_email',
+            'sender_name' => $this->senderName,
             'title' => "New email from {$this->senderName}",
             'body' => $this->subject,
             'action_url' => "/inbox?conversation={$this->conversationId}",

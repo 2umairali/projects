@@ -55,6 +55,15 @@
             </intent-filter>
         </activity>
 
+        <!-- System incoming-call UI is available before Flutter starts. -->
+        <activity android:name=".IncomingCallActivity" android:exported="false"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:showWhenLocked="true" android:turnScreenOn="true"
+            android:excludeFromRecents="true" android:noHistory="true"
+            android:taskAffinity="com.dahify.dahimail.incoming"
+            android:launchMode="singleTop"/>
+        <receiver android:name=".IncomingCallDeclineReceiver" android:exported="false"/>
+
         <!-- Returns the user to the app after Gmail / Outlook / Slack / Calendar / Salesforce sign-in
              (the server ends the flow with a redirect to dahimail://oauth?status=ok) -->
         <activity
@@ -75,10 +84,27 @@
             android:foregroundServiceType="microphone|camera"
             tools:replace="android:foregroundServiceType"/>
 
+        <!-- Required for the fallback incoming-call notification's Accept / Decline buttons. -->
+        <receiver
+            android:name="com.dexterous.flutterlocalnotifications.ActionBroadcastReceiver"
+            android:exported="false"/>
+
         <!-- Floating call window (audio calls) shown over other apps -->
         <service
             android:name=".CallOverlayService"
             android:exported="false"/>
+
+        <!-- FCM's service handles data-only calls even with no Flutter engine or Activity.
+             The receiver only retains legacy notification tap bookkeeping. -->
+        <service android:name="io.flutter.plugins.firebase.messaging.FlutterFirebaseMessagingService" tools:node="remove"/>
+        <service android:name=".NativeMessagingService" android:exported="false">
+            <intent-filter><action android:name="com.google.firebase.MESSAGING_EVENT"/></intent-filter>
+        </service>
+        <receiver android:name="io.flutter.plugins.firebase.messaging.FlutterFirebaseMessagingReceiver" tools:node="remove"/>
+        <receiver android:name=".NativePushReceiver" android:exported="true"
+            android:permission="com.google.android.c2dm.permission.SEND">
+            <intent-filter><action android:name="com.google.android.c2dm.intent.RECEIVE"/></intent-filter>
+        </receiver>
 
         <!-- Push notifications (Firebase): channel + icon used when the app is closed -->
         <meta-data android:name="com.google.firebase.messaging.default_notification_channel_id" android:value="dm_push"/>

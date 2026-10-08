@@ -77,3 +77,11 @@ test('missed audio rooms are described as audio rather than video in chat histor
     app(FriendCallService::class)->end($caller, 1);
     expect(DB::table('friend_messages')->where('call_id', 1)->value('body'))->toBe('Missed audio call');
 });
+
+test('polled call metadata keeps the original expiry when the app moves to background', function () {
+    $sent = now()->subSeconds(10)->startOfSecond();
+    DB::table('friend_calls')->where('id', 1)->update(['status' => 'ringing', 'created_at' => $sent, 'meeting_code' => null]);
+    $method = new ReflectionMethod(FriendCallService::class, 'shape');
+    $call = $method->invoke(app(FriendCallService::class), DB::table('friend_calls')->find(1), 12);
+    expect($call['sent_at'])->toBe($sent->timestamp)->and($call['ttl'])->toBe(45);
+});

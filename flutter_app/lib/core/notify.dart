@@ -1,7 +1,9 @@
 import 'dart:io' show Platform;
+import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -12,6 +14,7 @@ import 'sounds.dart';
 import 'theme.dart';
 import 'config.dart';
 import 'notification_presentation.dart';
+import 'notification_actions.dart';
 import 'device_env.dart';
 import 'nav.dart';
 import 'notification_tile.dart';
@@ -38,14 +41,27 @@ class NotifyService with WidgetsBindingObserver {
 
   /// Incremented when the user taps a notification – the shell opens the notification list.
   final ValueNotifier<int> tapped = ValueNotifier(0);
+  Map<String, dynamic>? pendingNotification;
+  void openRemote(Map<String, dynamic> data) {
+    pendingNotification = data;
+    tapped.value++;
+  }
 
   Future<void> init() async {
     if (_ready || kIsWeb) return;
     const android = AndroidInitializationSettings('ic_stat_notify');
-    const ios = DarwinInitializationSettings(requestAlertPermission: false, requestBadgePermission: false, requestSoundPermission: false);
+    final ios = DarwinInitializationSettings(requestAlertPermission: false, requestBadgePermission: false, requestSoundPermission: false,
+      notificationCategories: [
+        DarwinNotificationCategory('MESSAGE_VIEW', actions: [DarwinNotificationAction.plain('notification_view', 'View', options: {DarwinNotificationActionOption.foreground})]),
+        DarwinNotificationCategory('MESSAGE_REPLY', actions: [
+          DarwinNotificationAction.plain('notification_view', 'View', options: {DarwinNotificationActionOption.foreground}),
+          DarwinNotificationAction.text('notification_reply', 'Reply', buttonTitle: 'Send', placeholder: 'Write a reply', options: {DarwinNotificationActionOption.authenticationRequired}),
+        ]),
+      ]);
     await _plugin.initialize(
-      const InitializationSettings(android: android, iOS: ios),
+      InitializationSettings(android: android, iOS: ios),
       onDidReceiveNotificationResponse: _onResponse,
+      onDidReceiveBackgroundNotificationResponse: notificationBackgroundResponse,
     );
     WidgetsBinding.instance.addObserver(this);
     final a2 = _android;
@@ -75,6 +91,10 @@ class NotifyService with WidgetsBindingObserver {
 
   void _onResponse(NotificationResponse r) {
     final a = r.actionId ?? '';
+    if (a == 'notification_reply') { notificationBackgroundResponse(r); return; }
+    if ((r.payload ?? '').startsWith('{')) {
+      try { openRemote(Map<String, dynamic>.from(jsonDecode(r.payload!))); return; } catch (_) {}
+    }
     if (a == 'call_end') return onCallAction?.call('end');
     if (a == 'call_accept' || a == 'call_decline') {
       pendingCallAction = a;
@@ -147,7 +167,17 @@ class NotifyService with WidgetsBindingObserver {
     final presentation = notification == null ? null : NotificationPresentation.from(notification);
     final sender = notification == null ? '' : '${notification['sender_name'] ?? ''}'.trim();
     final displayTitle = sender.isEmpty ? title : sender;
-    final displayBody = sender.isEmpty ? body : '${presentation!.action(notification!)}${body.isEmpty ? '' : ' · $body'}';
+    final displayBody = notification == null ? body : NotificationPresentation.systemBody(notification, body);
+    final label = notification == null ? null : NotificationPresentation.systemLabel(notification);
+    if (defaultTargetPlatform == TargetPlatform.android && notification != null) {
+      try {
+        final shown = await const MethodChannel('com.dahify.dahimail/device').invokeMethod<bool>('showSystemAlert', {
+          ...notification, 'title': title, 'body': displayBody, 'category_label': label,
+          'notification_id': notification['notification_id'] ?? notification['id'] ?? '$id',
+        });
+        if (shown == true) return;
+      } catch (_) { /* Keep the local notification fallback available. */ }
+    }
     final avatar = await _avatarBitmap(notification == null ? null : NotificationPresentation.avatar(notification));
     final (name, desc) = _cats[category] ?? _cats['activity']!;
     // Android channel sound/vibration cannot change after creation → one channel per combination.
@@ -158,24 +188,27 @@ class NotifyService with WidgetsBindingObserver {
         channelId,
         name,
         channelDescription: desc,
-        importance: category == 'messages' ? Importance.high : Importance.defaultImportance,
-        priority: category == 'messages' ? Priority.high : Priority.defaultPriority,
+        importance: Importance.high,
+        priority: Priority.high,
         playSound: !silent,
         sound: (silent || prefs.soundId == 'default') ? null : RawResourceAndroidNotificationSound(prefs.soundId),
         enableVibration: prefs.notifVibrate,
         largeIcon: avatar,
-        icon: sender.isNotEmpty ? 'ic_stat_notify' : switch (presentation?.kind) {
-          'email' => 'ic_stat_email', 'chat' => 'ic_stat_chat', 'audio_call' => 'ic_stat_call',
-          'video_call' => 'ic_stat_video', 'meeting' => 'ic_stat_meeting', _ => 'ic_stat_notify',
-        },
+        icon: 'ic_stat_notify',
+        actions: notification == null ? null : [
+          const AndroidNotificationAction('notification_view', 'View', showsUserInterface: true),
+          if (NotificationTarget.from(notification) != null)
+            const AndroidNotificationAction('notification_reply', 'Reply', cancelNotification: false,
+              inputs: [AndroidNotificationActionInput(label: 'Reply')]),
+        ],
         color: presentation?.color ?? AppColors.primary,
-        subText: presentation?.label,
+        subText: label,
         styleInformation: BigTextStyleInformation(displayBody),
         groupKey: '${AppConfig.urlScheme}.${presentation?.kind ?? category}',
       ),
-      iOS: DarwinNotificationDetails(presentAlert: true, presentBadge: true, presentBanner: true, presentList: true, presentSound: !silent, subtitle: presentation?.label, threadIdentifier: presentation?.kind),
+      iOS: DarwinNotificationDetails(presentAlert: true, presentBadge: true, presentBanner: true, presentList: true, presentSound: !silent, subtitle: notification == null ? null : displayTitle, threadIdentifier: presentation?.kind, categoryIdentifier: notification != null && NotificationTarget.from(notification) != null ? 'MESSAGE_REPLY' : 'MESSAGE_VIEW'),
     );
-    await _plugin.show(id, displayTitle, displayBody, details, payload: category);
+    await _plugin.show(id, defaultTargetPlatform == TargetPlatform.iOS ? (label ?? displayTitle) : displayTitle, displayBody, details, payload: notification == null ? category : jsonEncode(notification));
   }
 
   // Avatar failure must never prevent the alert. Public HTTPS only; no session headers.
@@ -206,7 +239,7 @@ class NotifyService with WidgetsBindingObserver {
       backgroundColor: Theme.of(context).colorScheme.surface,
       content: NotificationTile(notification: data, compact: true, onTap: () {
         ScaffoldMessenger.maybeOf(context)?.hideCurrentSnackBar();
-        tapped.value++;
+        openRemote(Map<String, dynamic>.from(data));
       }),
     ));
   }
@@ -329,13 +362,14 @@ class NotifyService with WidgetsBindingObserver {
   /// screen on a locked phone, rings until answered, with Answer / Decline buttons.
   /// The channel is created here too: when the app was never opened since install (or was cleared), the background handler runs
   /// first – Android silently drops a notification posted to a channel that does not exist.
-  /// "_v2": a channel's sound cannot be changed after creation, so the ringtone needs a new id.
-  static const _callChannel = 'dm_calls_v2';
+  /// "_v3": Android keeps channel settings after creation; the LED defaults need a new id.
+  static const _callChannel = 'dm_calls_v3';
   static Future<void> _ensureCallChannel(FlutterLocalNotificationsPlugin p) async {
     try {
       await p.resolvePlatformSpecificImplementation<AndroidFlutterLocalNotificationsPlugin>()?.createNotificationChannel(
         const AndroidNotificationChannel(_callChannel, 'Incoming calls', description: 'Rings for incoming audio / video calls', importance: Importance.max,
-            playSound: true, sound: RawResourceAndroidNotificationSound('tritone'), enableVibration: true, audioAttributesUsage: AudioAttributesUsage.notificationRingtone),
+            playSound: true, sound: RawResourceAndroidNotificationSound('tritone'), enableVibration: true, enableLights: true, ledColor: Color(0xFF16A34A), showBadge: true,
+            audioAttributesUsage: AudioAttributesUsage.notificationRingtone),
       );
     } catch (_) {}
   }
@@ -344,8 +378,16 @@ class NotifyService with WidgetsBindingObserver {
     final sent = int.tryParse('${d['sent_at']}');
     final ttl = int.tryParse('${d['ttl']}') ?? 45;
     if (sent != null && DateTime.now().millisecondsSinceEpoch ~/ 1000 >= sent + ttl) return;
+    if (Platform.isAndroid) {
+      try {
+        final shown = await const MethodChannel('com.dahify.dahimail/device').invokeMethod<bool>('showIncomingCall', {
+          ...d, 'sent_at': sent ?? DateTime.now().millisecondsSinceEpoch ~/ 1000, 'ttl': ttl,
+        });
+        if (shown == true) return;
+      } catch (_) { /* Older hosts/background engines still use the notification fallback. */ }
+    }
     final p = FlutterLocalNotificationsPlugin();
-    await p.initialize(const InitializationSettings(android: AndroidInitializationSettings('ic_stat_notify'), iOS: DarwinInitializationSettings(requestAlertPermission: false, requestBadgePermission: false, requestSoundPermission: false)), onDidReceiveNotificationResponse: I._onResponse);
+    await p.initialize(const InitializationSettings(android: AndroidInitializationSettings('ic_stat_notify')), onDidReceiveNotificationResponse: I._onResponse, onDidReceiveBackgroundNotificationResponse: notificationBackgroundResponse);
     await _ensureCallChannel(p);
     final video = '${d['video']}' == '1' || '${d['video']}' == 'true';
     final audioOnly = '${d['audio_only']}' == '1' || '${d['audio_only']}' == 'true';
@@ -362,6 +404,8 @@ class NotifyService with WidgetsBindingObserver {
           fullScreenIntent: true, ongoing: true, autoCancel: false, timeoutAfter: ((int.tryParse('${d['ttl']}') ?? 45) * 1000 - (DateTime.now().millisecondsSinceEpoch - (int.tryParse('${d['sent_at']}') ?? DateTime.now().millisecondsSinceEpoch ~/ 1000) * 1000)).clamp(1000, 45000),
           sound: const RawResourceAndroidNotificationSound('tritone'), audioAttributesUsage: AudioAttributesUsage.notificationRingtone,
           visibility: NotificationVisibility.public, icon: 'ic_stat_notify',
+          channelShowBadge: true, number: 1, enableLights: true, ledColor: const Color(0xFF16A34A),
+          ledOnMs: 1000, ledOffMs: 1000,
           additionalFlags: Int32List.fromList(<int>[4]), // FLAG_INSISTENT: keeps ringing until answered / timeout
           actions: const [
             AndroidNotificationAction('call_accept', 'Accept', showsUserInterface: true),
@@ -376,7 +420,7 @@ class NotifyService with WidgetsBindingObserver {
   /// The caller hung up before we answered.
   static Future<void> cancelIncomingCall({int? callId}) async {
     final p = FlutterLocalNotificationsPlugin();
-    await p.initialize(const InitializationSettings(android: AndroidInitializationSettings('ic_stat_notify')));
+    await p.initialize(const InitializationSettings(android: AndroidInitializationSettings('ic_stat_notify')), onDidReceiveNotificationResponse: I._onResponse, onDidReceiveBackgroundNotificationResponse: notificationBackgroundResponse);
     await p.cancel(incomingNotificationId(callId));
   }
 

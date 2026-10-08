@@ -36,6 +36,7 @@ test('a failed device does not prevent high priority call delivery to another', 
     expect($sent)->toHaveCount(2);
     expect($sent[1]['android'])->toBe(['priority' => 'HIGH', 'ttl' => '20s']);
     expect($sent[1]['data']['call_id'])->toBe('42');
+    expect($sent[1]['data']['recipient_user_id'])->toBe('1');
     expect($sent[1])->not->toHaveKey('notification');
 });
 
@@ -130,7 +131,7 @@ test('sender identity survives database notifications through FCM while using a 
     expect($sent)->toHaveCount(2);
     expect($sent[0]['data']['sender_name'])->toBe('Alice Example');
     expect($sent[0]['notification']['title'])->toBe('Alice Example');
-    expect($sent[0]['notification']['body'])->toContain('sent a friend request');
+    expect($sent[0]['notification']['body'])->toBe('Sent you a friend request');
     expect($sent[0]['android']['notification']['image'])->toBe('https://example.test/avatar.jpg');
     expect($sent[0]['android']['notification']['icon'])->toBe('ic_stat_notify');
 });
@@ -214,4 +215,189 @@ test('relative credential paths work when an HTTP worker runs outside the Larave
     } finally {
         chdir($previous);
     }
+});
+
+
+test('Google login rejection is reported as authentication instead of unreachable', function () {
+    Cache::forget('fcm_access_token');
+    Http::preventStrayRequests();
+    Http::fake(['oauth2.googleapis.com/*' => Http::response(['error' => 'invalid_grant', 'error_description' => 'private-response'], 400)]);
+    $result = app(FcmPush::class)->probeToken('synthetic-a', 'android');
+    expect($result['code'])->toBe('authentication_rejected');
+    expect($result['stage'])->toBe('authentication');
+    expect(json_encode($result))->not->toContain('private-response');
+    Http::assertSentCount(1);
+});
+
+test('a cold token cache authenticates before validating the phone without sending an alert', function () {
+    Cache::forget('fcm_access_token');
+    Http::preventStrayRequests();
+    Http::fake([
+        'oauth2.googleapis.com/*' => Http::response(['access_token' => 'fresh-access', 'expires_in' => 3600, 'token_type' => 'Bearer']),
+        'fcm.googleapis.com/*' => Http::response(['name' => 'accepted']),
+    ]);
+    expect(app(FcmPush::class)->probeToken('synthetic-a', 'android')['accepted'])->toBeTrue();
+    Http::assertSent(fn ($r) => str_contains($r->url(), 'oauth2.googleapis.com') && $r->method() === 'POST');
+    Http::assertSent(fn ($r) => str_contains($r->url(), 'fcm.googleapis.com') && $r['validate_only'] === true && $r->hasHeader('Authorization', 'Bearer fresh-access'));
+    Http::assertSentCount(2);
+});
+
+test('token cache failures do not prevent fresh authentication and incoming call delivery', function () {
+    Cache::shouldReceive('get')->andThrow(new RuntimeException('private cache connection details'));
+    Cache::shouldReceive('put')->andThrow(new RuntimeException('private cache connection details'));
+    Http::preventStrayRequests();
+    Http::fake([
+        'oauth2.googleapis.com/*' => Http::response(['access_token' => 'fresh-access', 'expires_in' => 3600]),
+        'fcm.googleapis.com/*' => Http::response(['name' => 'accepted']),
+    ]);
+    app(FcmPush::class)->sendCall($this->user, ['call_id' => 42, 'sent_at' => time()], 20);
+    Http::assertSent(fn ($r) => str_contains($r->url(), 'fcm.googleapis.com') && $r['message']['android']['priority'] === 'HIGH');
+    Http::assertSentCount(3); // One login, two registered phones.
+});
+
+test('failed cache invalidation cannot reuse a rejected access token for the retry', function () {
+    Cache::shouldReceive('get')->andReturn('old-access');
+    Cache::shouldReceive('forget')->andThrow(new RuntimeException('cache unavailable'));
+    Cache::shouldReceive('put')->andThrow(new RuntimeException('cache unavailable'));
+    Http::preventStrayRequests();
+    Http::fake(function ($request) {
+        if (str_contains($request->url(), 'oauth2.googleapis.com')) return Http::response(['access_token' => 'fresh-access', 'expires_in' => 3600]);
+        return $request->hasHeader('Authorization', 'Bearer old-access')
+            ? Http::response(['error' => ['status' => 'UNAUTHENTICATED']], 401)
+            : Http::response(['name' => 'accepted']);
+    });
+    expect(app(FcmPush::class)->probeToken('synthetic-a', 'android')['accepted'])->toBeTrue();
+    Http::assertSentCount(3);
+});
+
+test('transport failures identify DNS TLS and timeout errors without disclosing requests', function ($errno, $expected) {
+    $request = new GuzzleHttp\Psr7\Request('POST', 'https://fcm.googleapis.com');
+    $cause = new GuzzleHttp\Exception\ConnectException('private transport details', $request, null, ['errno' => $errno]);
+    Http::fake(fn () => throw new Illuminate\Http\Client\ConnectionException('private outer details', 0, $cause));
+    $result = app(FcmPush::class)->probeToken('synthetic-a', 'android');
+    expect($result['code'])->toBe($expected);
+    expect($result['stage'])->toBe('delivery');
+    expect(json_encode($result))->not->toContain('private');
+})->with([[6, 'provider_dns_error'], [7, 'provider_connection_refused'], [28, 'provider_timeout'], [60, 'provider_tls_error']]);
+
+test('unexpected server exceptions are not misreported as network failure', function () {
+    Http::fake(fn () => throw new RuntimeException('private application details'));
+    $result = app(FcmPush::class)->probeToken('synthetic-a', 'android');
+    expect($result['code'])->toBe('push_server_error');
+    expect(json_encode($result))->not->toContain('private application details');
+});
+
+test('administrator probe shows the failed stage and repair hint', function () {
+    Http::fake(fn () => throw new Illuminate\Http\Client\ConnectionException('private details'));
+    $this->artisan('push:status', ['--user' => '1', '--probe' => true])
+        ->expectsOutputToContain('provider_unreachable')
+        ->expectsOutputToContain('delivery: The hosting server could not contact Google')
+        ->doesntExpectOutputToContain('private details')
+        ->doesntExpectOutputToContain('synthetic-a')
+        ->assertExitCode(1);
+});
+
+
+test('new Android builds get one native alert payload with category identity and safe reply target', function () {
+    DB::statement('ALTER TABLE device_tokens ADD COLUMN app_version TEXT');
+    DB::table('device_tokens')->where('token', 'synthetic-a')->update(['app_version' => '1.0.2+3']);
+    $sent = [];
+    Http::fake(function ($r) use (&$sent) { $sent[] = $r['message']; return Http::response(['name' => 'accepted']); });
+    app(FcmPush::class)->sendToUser($this->user, 'Alice Example', 'Hello', ['type' => 'chat', 'from_id' => 2, 'sender_name' => 'Alice Example']);
+    expect($sent[0])->not->toHaveKey('notification');
+    expect($sent[0]['data'])->toMatchArray(['notification_layout' => 'v2', 'category_label' => 'Chat', 'reply_kind' => 'friend', 'reply_id' => '2', 'recipient_user_id' => '1']);
+    expect($sent[0]['android']['priority'])->toBe('HIGH');
+    expect($sent[1])->toHaveKey('notification'); // Older clients still receive an OS alert.
+});
+
+test('only incoming message notifications expose a reply target', function () {
+    expect(App\Support\PushPresentation::replyTarget(['type' => 'email_received', 'action_url' => '/inbox?cid=7']))->toBe(['reply_kind' => 'conversation', 'reply_id' => '7']);
+    foreach (['missed_call', 'email_failed', 'friend_request'] as $type) {
+        expect(App\Support\PushPresentation::replyTarget(['type' => $type, 'from_id' => 2, 'action_url' => '/inbox?cid=7']))->toBe([]);
+    }
+});
+
+
+test('new iOS notifications carry the action envelope and an account-bound reply payload', function () {
+    DB::statement('ALTER TABLE device_tokens ADD COLUMN app_version TEXT');
+    Http::fake(fn () => Http::response(['name' => 'delivered'], 200));
+    DB::table('device_tokens')->insert(['user_id' => 1, 'token' => 'synthetic-ios-actions', 'platform' => 'ios', 'app_version' => '1.0.2+3']);
+    app(App\Services\FcmPush::class)->sendToUser($this->user, 'New email', 'Subject and preview', [
+        'type' => 'email_received', 'sender_name' => 'Alice Example', 'action_url' => '/inbox?cid=7',
+    ]);
+    Http::assertSent(function ($request) {
+        $message = $request->data()['message'] ?? [];
+        if (($message['token'] ?? '') !== 'synthetic-ios-actions') return false;
+        $payload = $message['apns']['payload'];
+        $reply = json_decode($payload['payload'], true);
+        return $payload['dm_local_actions'] === '1' && $payload['aps']['category'] === 'MESSAGE_REPLY'
+            && $payload['aps']['alert']['title'] === 'New email'
+            && $payload['aps']['alert']['subtitle'] === 'Alice Example'
+            && $reply['recipient_user_id'] === '1' && $reply['reply_id'] === '7';
+    });
+});
+
+test('real push test sends a native high priority alert rather than validation only', function () {
+    Http::fake(fn () => Http::response(['name' => 'accepted'], 200));
+    $this->artisan('push:status', ['--user' => '1', '--test' => true])
+        ->expectsOutputToContain('Accepted does not confirm phone receipt')
+        ->doesntExpectOutputToContain('synthetic-a')->assertExitCode(0);
+    Http::assertSentCount(2);
+    Http::assertSent(function ($request) {
+        $data = $request->data();
+        return empty($data['validate_only']) && !isset($data['message']['notification'])
+            && $data['message']['android']['priority'] === 'HIGH'
+            && $data['message']['data']['notification_layout'] === 'v2'
+            && isset($data['message']['data']['notification_id']);
+    });
+});
+
+test('real push test requires an explicit user and cannot be combined with probe', function () {
+    Http::fake();
+    $this->artisan('push:status', ['--test' => true])->assertExitCode(2);
+    $this->artisan('push:status', ['--user' => '1', '--test' => true, '--probe' => true])->assertExitCode(2);
+    Http::assertNothingSent();
+});
+
+
+test('system friend notifications use category full name and concise action on both phones', function () {
+    DB::statement('ALTER TABLE device_tokens ADD COLUMN app_version TEXT');
+    DB::table('device_tokens')->update(['app_version' => '1.0.5+6']);
+    DB::table('device_tokens')->where('token', 'synthetic-b')->update(['platform' => 'ios']);
+    Http::fake(fn () => Http::response(['name' => 'accepted']));
+    app(FcmPush::class)->sendToUser($this->user, 'Alice accepted your friend request', 'You can now message each other.', [
+        'type' => 'friend_accepted', 'sender_name' => 'Alice Example', 'notification_id' => 'friend-1',
+    ]);
+    Http::assertSent(fn ($r) => $r['message']['token'] === 'synthetic-a'
+        && $r['message']['data']['category_label'] === 'Friend request accepted'
+        && $r['message']['data']['sender_name'] === 'Alice Example'
+        && $r['message']['data']['body'] === 'Accepted your friend request');
+    Http::assertSent(fn ($r) => $r['message']['token'] === 'synthetic-b'
+        && $r['message']['apns']['payload']['aps']['alert'] === [
+            'title' => 'Friend request accepted', 'subtitle' => 'Alice Example', 'body' => 'Accepted your friend request',
+        ]);
+});
+
+test('current registrations receive calls before stale device timeouts', function () {
+    DB::statement('ALTER TABLE device_tokens ADD COLUMN updated_at TEXT');
+    DB::table('device_tokens')->where('token', 'synthetic-a')->update(['updated_at' => '2026-01-01 00:00:00']);
+    DB::table('device_tokens')->where('token', 'synthetic-b')->update(['updated_at' => '2026-10-08 00:00:00']);
+    $sent = [];
+    Http::fake(function ($r) use (&$sent) { $sent[] = $r['message']['token']; return Http::response(['name' => 'accepted']); });
+    app(FcmPush::class)->sendCall($this->user, ['call_id' => 42, 'sent_at' => time()]);
+    expect($sent)->toBe(['synthetic-b', 'synthetic-a']);
+});
+
+test('native iPhone calls do not wait on Firebase authentication', function () {
+    DB::statement('ALTER TABLE device_tokens ADD COLUMN voip_token TEXT');
+    DB::table('device_tokens')->where('token', 'synthetic-a')->delete();
+    DB::table('device_tokens')->update(['platform' => 'ios', 'voip_token' => 'synthetic-voip']);
+    Cache::forget('fcm_access_token');
+    Http::fake();
+    $this->mock(App\Services\ApnsVoip::class, function ($mock) {
+        $mock->shouldReceive('enabled')->andReturn(true);
+        $mock->shouldReceive('send')->once()->with('synthetic-voip', Mockery::on(fn ($data) => $data['call_id'] === '42'), false, 45)->andReturn(true);
+    });
+    app(FcmPush::class)->sendCall($this->user, ['call_id' => 42, 'sent_at' => time()]);
+    Http::assertNothingSent();
 });

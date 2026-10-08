@@ -10,6 +10,7 @@ import '../core/menus.dart';
 import '../core/app_permissions.dart';
 import '../core/notify.dart';
 import '../core/callkit.dart';
+import '../core/notification_navigation.dart';
 import '../core/push.dart';
 import '../core/prefs.dart';
 import '../core/refresh.dart';
@@ -73,6 +74,7 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver impleme
     PeoplePage.filter.addListener(_filterChanged);
     PeoplePage.openTeam = () => _openWorkspaceDest('ws_team');
     WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (NotifyService.I.pendingNotification != null) _openNotifications();
       _pollUnread();
       _timer = Timer.periodic(const Duration(seconds: 60), (_) => _pollUnread());
       // explain + ask once (notifications, calls on the lock screen); the push token is registered either way
@@ -104,7 +106,11 @@ class _AppShellState extends State<AppShell> with WidgetsBindingObserver impleme
   }
 
   void _openNotifications() {
-    if (mounted) pushPage(context, const NotificationsScreen());
+    if (!mounted) return;
+    final data = NotifyService.I.pendingNotification;
+    NotifyService.I.pendingNotification = null;
+    if (data != null) { NotificationNavigation.open(context, data); }
+    else { pushPage(context, const NotificationsScreen()); }
   }
 
   @override

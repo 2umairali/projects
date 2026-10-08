@@ -19,6 +19,10 @@ import io.flutter.embedding.engine.renderer.FlutterUiDisplayListener
 
 // FlutterFragmentActivity (not FlutterActivity) is required by the fingerprint / face prompt (local_auth).
 class MainActivity : FlutterFragmentActivity() {
+    companion object { @Volatile var isResumed = false }
+    override fun onResume() { super.onResume(); isResumed = true }
+    override fun onPause() { isResumed = false; super.onPause() }
+
     @Volatile private var uiReady = false
     private var callChannel: MethodChannel? = null
     /** Dart sets this while a VIDEO call is running: pressing Home then shrinks the call into Picture-in-Picture (like WhatsApp). */
@@ -48,9 +52,13 @@ class MainActivity : FlutterFragmentActivity() {
 
     // A call notification (full-screen intent) opens the app on top of the lock screen, like a normal phone call.
     private fun showOverLockscreenForCall(i: Intent?) {
-        if (i?.action == "SELECT_NOTIFICATION" && Build.VERSION.SDK_INT >= 27) {
-            setShowWhenLocked(true)
-            setTurnScreenOn(true)
+        if (i?.getStringExtra("actionId") in listOf("call_accept", "call_decline")) {
+            i?.getStringExtra("payload")?.substringAfter("call_incoming:")?.toIntOrNull()?.let { NativePushReceiver.dismissCall(this, it) }
+        }
+        if (Build.VERSION.SDK_INT >= 27) {
+            val incomingCall = i?.getStringExtra("payload")?.startsWith("call_incoming:") == true
+            setShowWhenLocked(incomingCall)
+            setTurnScreenOn(incomingCall)
         }
     }
 
@@ -64,7 +72,19 @@ class MainActivity : FlutterFragmentActivity() {
         // Facts read straight from the phone (used by lib/core/device_env.dart)
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, "com.dahify.dahimail/device").setMethodCallHandler { call, result ->
             when (call.method) {
+                "showIncomingCall" -> {
+                    val values = (call.arguments as? Map<*, *>)?.entries?.associate { it.key.toString() to it.value.toString() } ?: emptyMap()
+                    try { result.success(NativePushReceiver.showCall(this, values)) }
+                    catch (_: Exception) { result.success(false) }
+                }
+                "showSystemAlert" -> {
+                    val values = (call.arguments as? Map<*, *>)?.entries?.associate { it.key.toString() to it.value.toString() } ?: emptyMap()
+                    try { result.success(NativePushReceiver.showAlert(this, values)) }
+                    catch (_: Exception) { result.success(false) }
+                }
                 "timezone" -> result.success(TimeZone.getDefault().id)
+                "notificationDiagnostics" -> result.success(NativePushReceiver.diagnostics(this))
+                "lastNativePushAt" -> result.success(getSharedPreferences("native_push", MODE_PRIVATE).getLong("last_received", 0))
                 "canFullScreenIntent" -> {
                     val nm = getSystemService(android.app.NotificationManager::class.java)
                     result.success(if (Build.VERSION.SDK_INT >= 34) nm.canUseFullScreenIntent() else true)

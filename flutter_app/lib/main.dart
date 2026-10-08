@@ -7,6 +7,7 @@ import 'core/api.dart';
 import 'core/android_callkit.dart';
 import 'core/app_lock.dart';
 import 'core/config.dart';
+import 'core/conversation_visibility.dart';
 import 'core/device_env.dart';
 import 'core/push.dart';
 import 'core/room_host.dart';
@@ -78,6 +79,7 @@ class DahiMailApp extends StatelessWidget {
       title: AppConfig.appName,
       debugShowCheckedModeBanner: false,
       navigatorKey: rootNavKey,
+      navigatorObservers: [conversationRoutes],
       theme: AppTheme.light(),
       darkTheme: AppTheme.dark(),
       themeMode: mode,

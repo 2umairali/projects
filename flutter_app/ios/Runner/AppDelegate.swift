@@ -1,4 +1,5 @@
 import Flutter
+import flutter_local_notifications
 import UIKit
 import PushKit
 import CallKit
@@ -33,6 +34,10 @@ import WebRTC
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]?
   ) -> Bool {
+    FlutterLocalNotificationsPlugin.setPluginRegistrantCallback { registry in
+      GeneratedPluginRegistrant.register(with: registry)
+    }
+    UNUserNotificationCenter.current().delegate = self
     setupCallKit()
     setupPushKit()
     application.registerForRemoteNotifications() // APNs token for normal pushes (needed before Firebase can give a token)
